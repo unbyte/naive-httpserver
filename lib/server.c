@@ -1,5 +1,4 @@
 #include <string.h>
-#include <malloc.h>
 #include <assert.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -15,9 +14,9 @@
 
 #define LOWER_CHAR(c) (c >= 'A' && c <= 'Z' ? c + 32 : c)
 
-#define SESSION_TIMEOUT 10
-#define SESSION_KEEP_ALIVE_TIMEOUT 30
-#define SESSION_KEEP_ALIVE_TIMEOUT_RESPONSE "timeout=30, max=1000"
+#define SESSION_TIMEOUT 20
+#define SESSION_KEEP_ALIVE_TIMEOUT 60
+#define SESSION_KEEP_ALIVE_TIMEOUT_RESPONSE "timeout=60, max=1000"
 
 #define REQUEST_BUFFER_SIZE (1<<10)
 #define MAX_REQUEST_BUFFER_SIZE (1<<23)
@@ -100,6 +99,19 @@ char const *const nh_http_status[600] = {
 typedef void (*ev_handler_t)(struct epoll_event *);
 
 typedef struct {
+    char *buf;
+    uint32_t capacity;
+    uint32_t length;
+    uint32_t index;
+} nh_stream_t;
+
+typedef struct nh_header_s {
+    char const *key;
+    char const *value;
+    struct nh_header_s *next;
+} nh_header_t;
+
+typedef struct {
     ev_handler_t handler;
 } ev_cb_t;
 
@@ -112,7 +124,7 @@ typedef enum {
 typedef struct {
     uint16_t status;
     nh_header_t *header;
-    nh_string_t body;
+    http_string_t body;
     nh_stream_t raw;
 } nh_response_t;
 
@@ -126,7 +138,7 @@ typedef struct {
     nh_anchor_t value;
 } nh_kv_anchor_t;
 
-struct nh_context_s {
+struct http_context_s {
     nh_anchor_t method;
     nh_anchor_t path;
     nh_anchor_t body;
@@ -144,20 +156,20 @@ typedef struct {
     int socket;
     int timer_fd;
     nh_session_state_t state;
-    nh_context_t context;
+    http_context_t context;
     uint8_t flags;
     uint8_t timeout;
 
-    nh_server_t *server;
+    httpserver_t *server;
 } nh_session_t;
 
-struct nh_server_s {
+struct httpserver_s {
     // for accepting and handling sessions
     ev_handler_t handler;
     int socket;
     int loop;
 
-    void (*request_handler)(nh_context_t *);
+    void (*request_handler)(http_context_t *);
 
     struct sockaddr_in addr;
     socklen_t addr_len;
@@ -185,6 +197,8 @@ void nh_stream_free(nh_stream_t *stream) {
     if (stream->buf != NIL) {
         free(stream->buf);
         stream->buf = NIL;
+        stream->length = 0;
+        stream->index = 0;
     }
 }
 
@@ -196,14 +210,14 @@ void nh_stream_init(nh_stream_t *stream) {
     }
 }
 
-void nh_string_free(nh_string_t *string) {
+void nh_string_free(http_string_t *string) {
     if (string->value != NIL) {
         free((void *) string->value);
         string->value = NIL;
     }
 }
 
-void nh_context_free(nh_context_t *ctx) {
+void nh_context_clear(http_context_t *ctx) {
     if (ctx->header != NIL) {
         free(ctx->header);
         ctx->header = NIL;
@@ -215,6 +229,7 @@ void nh_context_free(nh_context_t *ctx) {
         header = tmp->next;
         free(tmp);
     }
+    ctx->response.header = NIL;
     nh_stream_free(&ctx->response.raw);
     nh_stream_free(&ctx->raw);
 }
@@ -300,47 +315,47 @@ void nh_stream_copy(nh_stream_t *stream, char const src[static 1], uint32_t size
  * Utils Implement
 **/
 
-nh_string_t get_request_header(nh_context_t *ctx, const char *key) {
+http_string_t get_request_header(http_context_t *ctx, const char *key) {
     size_t len = strlen(key);
     nh_kv_anchor_t cur;
     for (uint32_t i = 0; i < ctx->header_len; ++i) {
         cur = ctx->header[i];
         if (cur.key.len == len && nh_string_cmp_case_insensitive(key, &ctx->raw.buf[cur.key.index], len)) {
-            return (nh_string_t) {
+            return (http_string_t) {
                 .value = &ctx->raw.buf[cur.value.index],
                 .len = cur.value.len,
             };
         }
     }
-    return (nh_string_t) {};
+    return (http_string_t) {};
 }
 
-nh_string_t get_request_path(nh_context_t *ctx) {
-    return (nh_string_t) {
+http_string_t get_request_path(http_context_t *ctx) {
+    return (http_string_t) {
         .value = &ctx->raw.buf[ctx->path.index],
         .len = ctx->path.len
     };
 }
 
-nh_string_t get_request_method(nh_context_t *ctx) {
-    return (nh_string_t) {
+http_string_t get_request_method(http_context_t *ctx) {
+    return (http_string_t) {
         .value = &ctx->raw.buf[ctx->method.index],
         .len = ctx->method.len
     };
 }
 
-nh_string_t get_request_body(nh_context_t *ctx) {
-    return (nh_string_t) {
+http_string_t get_request_body(http_context_t *ctx) {
+    return (http_string_t) {
         .value = &ctx->raw.buf[ctx->body.index],
         .len = ctx->body.len
     };
 }
 
-void set_response_status(nh_context_t *ctx, uint16_t status) {
+void set_response_status(http_context_t *ctx, uint16_t status) {
     ctx->response.status = status > 599 || status < 100 ? 500 : status;
 }
 
-void set_response_header(nh_context_t *ctx, const char *key, const char *value) {
+void set_response_header(http_context_t *ctx, const char *key, const char *value) {
     nh_header_t *h = (nh_header_t *) malloc(sizeof(nh_header_t));
     assert(h != NIL);
     h->key = key;
@@ -349,18 +364,18 @@ void set_response_header(nh_context_t *ctx, const char *key, const char *value) 
     ctx->response.header = h;
 }
 
-void set_response_body(nh_context_t *ctx, char const *body) {
-    ctx->response.body = (nh_string_t) {
+void set_response_body(http_context_t *ctx, char const *body) {
+    ctx->response.body = (http_string_t) {
         .value = body,
         .len = strlen(body)
     };
 }
 
-void set_response_body_string(nh_context_t *ctx, nh_string_t body) {
+void set_response_body_string(http_context_t *ctx, http_string_t body) {
     ctx->response.body = body;
 }
 
-char *string_to_chars(nh_string_t string) {
+char *string_to_chars(http_string_t string) {
     char *result = malloc(sizeof(char) * (string.len + 1));
     assert(result != NIL);
     strcpy(result, string.value);
@@ -368,7 +383,7 @@ char *string_to_chars(nh_string_t string) {
     return result;
 }
 
-int string_cmp_chars(nh_string_t string, char const *chars) {
+int string_cmp_chars(http_string_t string, char const *chars) {
     return strlen(chars) == string.len && nh_string_cmp(string.value, chars, string.len);
 }
 
@@ -377,13 +392,13 @@ int string_cmp_chars(nh_string_t string, char const *chars) {
 **/
 
 // help parse header in http request, return 0 means error
-int nh_http_parse_consume_header(nh_context_t *ctx);
+int nh_http_parse_consume_header(http_context_t *ctx);
 
 // parse http request
-int nh_http_parse(nh_context_t *ctx);
+int nh_http_parse(http_context_t *ctx);
 
 // generate http response
-void nh_generate_http_response(nh_context_t *ctx);
+void nh_generate_http_response(http_context_t *ctx);
 
 // init session and read and parse raw to request
 void nh_session_read(nh_session_t *session);
@@ -392,7 +407,7 @@ void nh_session_read(nh_session_t *session);
 void nh_session_write(nh_session_t *session);
 
 // end a session and clear resources
-void nh_session_clear(nh_session_t *session);
+void nh_session_free(nh_session_t *session);
 
 // handler before user's
 void nh_session_pre_handler(nh_session_t *session);
@@ -416,13 +431,13 @@ void nh_server_events_cb(struct epoll_event *ev);
 void nh_server_bind(int socket, struct sockaddr_in *addr, const char *ip, int port);
 
 // add server events on epoll (accept)
-void nh_server_listen(nh_server_t *server, char const *ip, int port);
+void nh_server_listen(httpserver_t *server, char const *ip, int port);
 
 /**
  * Server Internal Function Implements
 **/
 
-int nh_http_parse_consume_header(nh_context_t *ctx) {
+int nh_http_parse_consume_header(http_context_t *ctx) {
     if (ctx->header == NIL) {
         ctx->header = (nh_kv_anchor_t *) malloc(sizeof(nh_kv_anchor_t) * REQUEST_HEADER_INIT_SIZE);
         ctx->header_capacity = REQUEST_HEADER_INIT_SIZE;
@@ -464,7 +479,7 @@ typedef enum {
 } nh_http_parse_state_t;
 
 // 0 means error
-int nh_http_parse(nh_context_t *ctx) {
+int nh_http_parse(http_context_t *ctx) {
     //         Request       = Request-Line
     //                        *(( general-header
     //                         | request-header
@@ -524,7 +539,7 @@ int nh_http_parse(nh_context_t *ctx) {
     return 1;
 }
 
-void nh_generate_http_response(nh_context_t *ctx) {
+void nh_generate_http_response(http_context_t *ctx) {
     nh_stream_t *stream = &ctx->response.raw;
     nh_response_t *response = &ctx->response;
 
@@ -575,8 +590,6 @@ void nh_session_pre_handler(nh_session_t *session) {
 void nh_session_read(nh_session_t *session) {
     session->state = SESSION_READ;
     session->timeout = SESSION_TIMEOUT;
-    nh_context_free(&session->context);
-    session->context = (nh_context_t) {0};
 
     if (nh_read_socket(&session->context.raw, session->socket) == 0) {
         session->state = SESSION_END;
@@ -596,17 +609,15 @@ void nh_session_read(nh_session_t *session) {
         set_response_status(&session->context, 400);
         set_response_body(&session->context, "Bad Request");
     }
+
+    nh_stream_init(&session->context.response.raw);
+    nh_generate_http_response(&session->context);
     nh_session_write(session);
 }
 
 void nh_session_write(nh_session_t *session) {
     session->state = SESSION_WRITE;
     nh_stream_t *stream = &session->context.response.raw;
-    if (stream->buf == NIL) {
-        nh_stream_init(stream);
-        nh_generate_http_response(&session->context);
-    }
-
     if (!nh_write_socket(stream, session->socket)) {
         // pipe error
         session->state = SESSION_END;
@@ -622,7 +633,9 @@ void nh_session_write(nh_session_t *session) {
         return;
     }
 
+
     if (FLAG_CHECK(session->flags, SESSION_FLAG_KEEP_ALIVE)) {
+        nh_context_clear(&session->context);
         session->state = SESSION_READ;
         session->timeout = SESSION_KEEP_ALIVE_TIMEOUT;
     } else {
@@ -630,7 +643,7 @@ void nh_session_write(nh_session_t *session) {
     }
 }
 
-void nh_session_clear(nh_session_t *session) {
+void nh_session_free(nh_session_t *session) {
     // clear events
     epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->socket, NIL);
     epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->timer_fd, NIL);
@@ -638,7 +651,7 @@ void nh_session_clear(nh_session_t *session) {
     close(session->timer_fd);
     close(session->socket);
     // free memory
-    nh_context_free(&session->context);
+    nh_context_clear(&session->context);
     free(session);
 }
 
@@ -653,11 +666,11 @@ void nh_session_handler(nh_session_t *session) {
         case SESSION_END:
             break;
     }
-    if (session->state == SESSION_END) nh_session_clear(session);
+    if (session->state == SESSION_END) nh_session_free(session);
 }
 
 void nh_server_events_cb(struct epoll_event *ev) {
-    nh_server_t *server = (nh_server_t *) ev->data.ptr;
+    httpserver_t *server = (httpserver_t *) ev->data.ptr;
     int socket;
     while ((socket = accept(server->socket, (struct sockaddr *) &server->addr, &server->addr_len)) > 0) {
         // init session
@@ -685,7 +698,7 @@ void nh_session_event_timer_cb(struct epoll_event *ev) {
     nh_session_t *session = (nh_session_t *) (ev->data.ptr - sizeof(ev_handler_t));
     uint64_t res;
     session->timeout -= 1;
-    if (session->timeout == 0) nh_session_clear(session);
+    if (session->timeout == 0) nh_session_free(session);
 }
 
 void nh_session_register_events(nh_session_t *session) {
@@ -723,7 +736,7 @@ void nh_server_bind(int socket, struct sockaddr_in *addr, const char *ip, int po
     }
 }
 
-void nh_server_listen(nh_server_t *server, char const *ip, int port) {
+void nh_server_listen(httpserver_t *server, char const *ip, int port) {
     // socket init
     signal(SIGPIPE, SIG_IGN);
     server->socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -747,8 +760,8 @@ void nh_server_listen(nh_server_t *server, char const *ip, int port) {
  * Entry Implement
  **/
 
-nh_server_t *httpserver_init(void (*handler)(nh_context_t *)) {
-    nh_server_t *server = (nh_server_t *) malloc(sizeof(nh_server_t));
+httpserver_t *httpserver_init(void (*handler)(http_context_t *)) {
+    httpserver_t *server = (httpserver_t *) malloc(sizeof(httpserver_t));
     assert(server != NIL);
     server->handler = nh_server_events_cb;
     server->request_handler = handler;
@@ -756,11 +769,11 @@ nh_server_t *httpserver_init(void (*handler)(nh_context_t *)) {
     return server;
 }
 
-int httpserver_listen(nh_server_t *server, int port) {
+int httpserver_listen(httpserver_t *server, int port) {
     return httpserver_listen_ip(server, NIL, port);
 }
 
-int httpserver_listen_ip(nh_server_t *server, const char *ip, int port) {
+int httpserver_listen_ip(httpserver_t *server, const char *ip, int port) {
     nh_server_listen(server, ip, port);
     struct epoll_event ev_list[1];
     while (1) {
