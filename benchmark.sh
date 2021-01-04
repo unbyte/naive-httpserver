@@ -1,7 +1,7 @@
 echo -e "\nUse Wrk\n"
 
 wrk -t10 -c200 -d10s http://127.0.0.1:4399/ > wrk.bench
-cat common.bench 1>&2
+cat wrk.bench 1>&2
 
 echo -e "\nDone.\n"
 
