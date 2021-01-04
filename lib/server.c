@@ -143,6 +143,14 @@ typedef enum {
     HTTP_1_1
 } nh_http_version;
 
+typedef enum {
+    PARSE_METHOD, PARSE_PATH, PARSE_VERSION,
+    PARSE_HEADER,
+    PARSE_BODY,
+    PARSE_LINE_END,
+    PARSE_DONE,
+} nh_http_parse_state;
+
 struct http_context_s {
     nh_http_version version;
     nh_anchor_t method;
@@ -152,6 +160,7 @@ struct http_context_s {
     uint32_t header_len;
     uint32_t header_capacity;
     nh_stream_t raw;
+    nh_http_parse_state parse_state;
     nh_response_t response;
 };
 
@@ -228,6 +237,7 @@ void nh_context_clear(http_context_t *ctx) {
         free(ctx->header);
         ctx->header = NIL;
     }
+
     nh_header_t *header = ctx->response.header;
     nh_header_t *tmp;
     while (header != NIL) {
@@ -235,9 +245,13 @@ void nh_context_clear(http_context_t *ctx) {
         header = tmp->next;
         free(tmp);
     }
+
     ctx->response.header = NIL;
     nh_stream_free(&ctx->response.raw);
     nh_stream_free(&ctx->raw);
+
+    ctx->response = (nh_response_t) {};
+    ctx->parse_state = PARSE_METHOD;
 }
 
 // returns 0 means no new bytes
@@ -248,7 +262,7 @@ int nh_read_socket(nh_stream_t *buf, int socket) {
     int bytes;
     while (buf->capacity < MAX_REQUEST_BUFFER_SIZE
            && (bytes = read(socket, buf->buf + buf->length, buf->capacity - buf->length)) > 0) {
-        if (bytes > 0) buf->length += bytes;
+        buf->length += bytes;
         if (buf->length == buf->capacity && buf->capacity != MAX_REQUEST_BUFFER_SIZE) {
             buf->capacity = buf->capacity * 2 > MAX_REQUEST_BUFFER_SIZE
                             ? MAX_REQUEST_BUFFER_SIZE
@@ -400,6 +414,9 @@ int string_cmp_chars(http_string_t string, char const *chars) {
 // help parse header in http request, return 0 means error
 int nh_http_parse_consume_header(http_context_t *ctx);
 
+// help parse body in http request, return 0 means not complete
+int nh_http_parse_consume_body(http_context_t *ctx);
+
 // parse http request
 int nh_http_parse(http_context_t *ctx);
 
@@ -477,14 +494,25 @@ int nh_http_parse_consume_header(http_context_t *ctx) {
     return 1;
 }
 
-typedef enum {
-    PARSE_LINE_END,
-    PARSE_METHOD, PARSE_PATH, PARSE_VERSION,
-    PARSE_HEADER,
-    PARSE_BODY
-} nh_http_parse_state_t;
+int nh_http_parse_consume_body(http_context_t *ctx) {
+    http_string_t length_str = get_request_header(ctx, "Content-Length");
+    if (length_str.len == 0) return 1;
+    int length = atoi(string_to_chars(length_str));
+    if (length <= 0) return 1;
 
-// 0 means error
+    nh_stream_t *stream = &ctx->raw;
+    if (ctx->body.index == 0) ctx->body.index = stream->index;
+    if (stream->length - stream->index > length) {
+        ctx->body.len = length;
+        stream->index += length;
+    } else if (ctx->body.len < length) {
+        ctx->body.len = stream->length - ctx->body.index;
+        stream->index = stream->length;
+    }
+    return ctx->body.len == length;
+}
+
+// 0 means error, -1 means not complete, 1 means success and complete
 int nh_http_parse(http_context_t *ctx) {
     //         Request       = Request-Line
     //                        *(( general-header
@@ -495,21 +523,19 @@ int nh_http_parse(http_context_t *ctx) {
     //
     // Request-Line   = Method SP Request-URI SP HTTP-Version CRLF
     nh_stream_t *stream = &ctx->raw;
-    stream->index = 0;
-    nh_http_parse_state_t state = PARSE_METHOD;
     int offset;
     while (stream->index < stream->length) {
-        switch (state) {
+        switch (ctx->parse_state) {
             case PARSE_METHOD:
                 if ((offset = nh_stream_find_next(stream, ' ', 16)) <= 0) return 0;
                 ctx->method = (nh_anchor_t) {.index = stream->index, .len = offset};
-                state = PARSE_PATH;
+                ctx->parse_state = PARSE_PATH;
                 stream->index += offset + 1;
                 break;
             case PARSE_PATH:
                 if ((offset = nh_stream_find_next(stream, ' ', 2048)) <= 0) return 0;
                 ctx->path = (nh_anchor_t) {.index = stream->index, .len = offset};
-                state = PARSE_VERSION;
+                ctx->parse_state = PARSE_VERSION;
                 stream->index += offset + 1;
                 break;
             case PARSE_VERSION:
@@ -525,7 +551,7 @@ int nh_http_parse(http_context_t *ctx) {
                     default:
                         return 0;
                 }
-                state = PARSE_LINE_END;
+                ctx->parse_state = PARSE_LINE_END;
                 stream->index += 1;
                 break;
             case PARSE_LINE_END:
@@ -534,22 +560,21 @@ int nh_http_parse(http_context_t *ctx) {
                 if (nh_string_cmp("\r\n", &stream->buf[stream->index], 2)) {
                     // no head, parse body directly
                     stream->index += 2;
-                    state = PARSE_BODY;
+                    ctx->parse_state = PARSE_BODY;
                 } else {
-                    state = PARSE_HEADER;
+                    ctx->parse_state = PARSE_HEADER;
                 }
                 break;
             case PARSE_HEADER:
                 if (!nh_http_parse_consume_header(ctx)) return 0;
-                state = PARSE_LINE_END;
-                break;
-            case PARSE_BODY:
-                ctx->body = (nh_anchor_t) {.index = stream->index, .len = stream->length - stream->index};
-                stream->index = stream->length;
+                ctx->parse_state = PARSE_LINE_END;
                 break;
             default:
                 break;
         }
+    }
+    if (ctx->parse_state == PARSE_BODY) {
+        if (nh_http_parse_consume_body(ctx)) ctx->parse_state = PARSE_DONE;
     }
     return 1;
 }
@@ -600,17 +625,16 @@ void nh_session_pre_handler(nh_session_t *session) {
 void nh_session_read(nh_session_t *session) {
     session->state = SESSION_READ;
     session->timeout = SESSION_TIMEOUT;
-    nh_context_clear(&session->context);
 
     if (nh_read_socket(&session->context.raw, session->socket) == 0) {
         session->state = SESSION_END;
         return;
     }
-    // init response
-    session->context.response = (nh_response_t) {};
 
-    // parse http
-    if (nh_http_parse(&session->context)) {
+    int result = nh_http_parse(&session->context);
+    if (session->context.parse_state != PARSE_DONE) return;
+
+    if (result) {
         // success, process
         nh_session_pre_handler(session);
         session->server->request_handler(&session->context);
@@ -619,7 +643,6 @@ void nh_session_read(nh_session_t *session) {
         set_response_status(&session->context, 400);
         set_response_body(&session->context, "Bad Request");
     }
-
     nh_stream_init(&session->context.response.raw);
     nh_generate_http_response(&session->context);
     nh_session_write(session);
@@ -644,6 +667,7 @@ void nh_session_write(nh_session_t *session) {
     }
 
     if (FLAG_CHECK(session->flags, SESSION_FLAG_KEEP_ALIVE)) {
+        nh_context_clear(&session->context);
         session->state = SESSION_READ;
         session->timeout = SESSION_KEEP_ALIVE_TIMEOUT;
     } else {
@@ -706,8 +730,7 @@ void nh_session_event_timer_cb(struct epoll_event *ev) {
     nh_session_t *session = (nh_session_t *) (ev->data.ptr - sizeof(ev_handler_t));
     uint64_t res;
     read(session->timer_fd, &res, sizeof(res));
-    session->timeout -= 2;
-    if (session->timeout <= 0) {
+    if (--session->timeout == 0) {
         nh_session_free(session);
     }
 }
@@ -725,8 +748,8 @@ void nh_session_register_events(nh_session_t *session) {
     // init timer
     int timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
     struct itimerspec ts = {};
-    ts.it_value.tv_sec = 2;
-    ts.it_interval.tv_sec = 2;
+    ts.it_value.tv_sec = 1;
+    ts.it_interval.tv_sec = 1;
     timerfd_settime(timer_fd, 0, &ts, NIL);
 
     session->timer_fd = timer_fd;
