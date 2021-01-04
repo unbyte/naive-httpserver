@@ -225,11 +225,17 @@ void nh_stream_init(nh_stream_t *stream) {
     }
 }
 
-void nh_string_free(http_string_t *string) {
-    if (string->value != NIL) {
-        free((void *) string->value);
-        string->value = NIL;
+uint32_t nh_string_to_uint(http_string_t string) {
+    if (string.value == NIL) {
+        return 0;
     }
+    uint32_t result = 0;
+    uint32_t index = 0;
+    while (index < string.len && string.value[index] >= '0' && string.value[index] <= '9') {
+        result = result * 10 + string.value[index] - 48;
+        ++index;
+    }
+    return result;
 }
 
 void nh_context_clear(http_context_t *ctx) {
@@ -245,8 +251,8 @@ void nh_context_clear(http_context_t *ctx) {
         header = tmp->next;
         free(tmp);
     }
-
     ctx->response.header = NIL;
+
     nh_stream_free(&ctx->response.raw);
     nh_stream_free(&ctx->raw);
 
@@ -497,7 +503,7 @@ int nh_http_parse_consume_header(http_context_t *ctx) {
 int nh_http_parse_consume_body(http_context_t *ctx) {
     http_string_t length_str = get_request_header(ctx, "Content-Length");
     if (length_str.len == 0) return 1;
-    int length = atoi(string_to_chars(length_str));
+    uint32_t length = nh_string_to_uint(length_str);
     if (length <= 0) return 1;
 
     nh_stream_t *stream = &ctx->raw;
@@ -510,6 +516,7 @@ int nh_http_parse_consume_body(http_context_t *ctx) {
         stream->index = stream->length;
     }
     return ctx->body.len == length;
+//    return 1;
 }
 
 // 0 means error, -1 means not complete, 1 means success and complete
@@ -560,10 +567,13 @@ int nh_http_parse(http_context_t *ctx) {
                 if (nh_string_cmp("\r\n", &stream->buf[stream->index], 2)) {
                     // no head, parse body directly
                     stream->index += 2;
-                    ctx->parse_state = PARSE_BODY;
+                    ctx->parse_state = stream->index == stream->length ? PARSE_DONE : PARSE_BODY;
                 } else {
                     ctx->parse_state = PARSE_HEADER;
                 }
+                break;
+            case PARSE_BODY:
+                if (nh_http_parse_consume_body(ctx))ctx->parse_state = PARSE_DONE;
                 break;
             case PARSE_HEADER:
                 if (!nh_http_parse_consume_header(ctx)) return 0;
@@ -572,9 +582,6 @@ int nh_http_parse(http_context_t *ctx) {
             default:
                 break;
         }
-    }
-    if (ctx->parse_state == PARSE_BODY) {
-        if (nh_http_parse_consume_body(ctx)) ctx->parse_state = PARSE_DONE;
     }
     return 1;
 }

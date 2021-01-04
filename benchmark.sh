@@ -22,8 +22,8 @@ cat keep-alive.bench 1>&2
 sleep 5
 
 echo -e "\nPost with body\n"
-dd if=/dev/urandom of=test_body bs=1024 count=1 2> /dev/null
-ab -c 5 -n 200 -p test_body http://127.0.0.1:4399/echo > post-body.bench
+dd if=/dev/urandom of=test_body bs=512 count=1 2> /dev/null
+ab -c 10 -n 200 -p test_body http://127.0.0.1:4399/echo > post-body.bench
 cat post-body.bench 1>&2
 
 echo -e "\nClear temp files\n"
