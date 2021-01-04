@@ -8,7 +8,8 @@ void handler(http_context_t *ctx) {
         set_response_header(ctx, "Content-Type", "text/html");
         set_response_body(ctx, "<h1>Hello World</h1>");
         return;
-    } else if (string_cmp_chars(method, "POST") && string_cmp_chars(path, "/echo")){
+    }
+    if (string_cmp_chars(method, "POST") && string_cmp_chars(path, "/echo")) {
         set_response_status(ctx, 200);
         set_response_body_string(ctx, get_request_body(ctx));
         return;

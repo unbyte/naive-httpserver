@@ -14,9 +14,9 @@
 
 #define LOWER_CHAR(c) (c >= 'A' && c <= 'Z' ? c + 32 : c)
 
-#define SESSION_TIMEOUT 20
-#define SESSION_KEEP_ALIVE_TIMEOUT 60
-#define SESSION_KEEP_ALIVE_TIMEOUT_RESPONSE "timeout=60, max=1000"
+#define SESSION_TIMEOUT 10
+#define SESSION_KEEP_ALIVE_TIMEOUT 30
+#define SESSION_KEEP_ALIVE_TIMEOUT_RESPONSE "timeout=30, max=1000"
 
 #define REQUEST_BUFFER_SIZE (1<<10)
 #define MAX_REQUEST_BUFFER_SIZE (1<<23)
@@ -138,7 +138,13 @@ typedef struct {
     nh_anchor_t value;
 } nh_kv_anchor_t;
 
+typedef enum {
+    HTTP_1_0,
+    HTTP_1_1
+} nh_http_version;
+
 struct http_context_s {
+    nh_http_version version;
     nh_anchor_t method;
     nh_anchor_t path;
     nh_anchor_t body;
@@ -509,7 +515,16 @@ int nh_http_parse(http_context_t *ctx) {
             case PARSE_VERSION:
                 if (!nh_string_cmp("HTTP/1.", &stream->buf[stream->index], 7)) return 0;
                 stream->index += 7;
-                if (stream->buf[stream->index] != '0' && stream->buf[stream->index] != '1') return 0;
+                switch (stream->buf[stream->index]) {
+                    case '0':
+                        ctx->version = HTTP_1_0;
+                        break;
+                    case '1':
+                        ctx->version = HTTP_1_1;
+                        break;
+                    default:
+                        return 0;
+                }
                 state = PARSE_LINE_END;
                 stream->index += 1;
                 break;
@@ -567,35 +582,30 @@ void nh_generate_http_response(http_context_t *ctx) {
 void nh_session_pre_handler(nh_session_t *session) {
     // just for keep alive now
     // TODO add more feature
-    nh_stream_t *stream = &session->context.raw;
-    nh_kv_anchor_t *h;
-    for (uint32_t i = 0; i < session->context.header_len; ++i) {
-        h = &session->context.header[i];
-        if (h->key.len == 10
-            && nh_string_cmp_case_insensitive("Connection", &stream->buf[h->key.index], 10)
-            && h->value.len == 10
-            && nh_string_cmp_case_insensitive("keep-alive", &stream->buf[h->value.index], 10)) {
-            // is KeepAlive
+    if (session->context.version == HTTP_1_1) {
+        http_string_t connection = get_request_header(&session->context, "Connection");
+        if (connection.len > 5) {
+            // not "close"
             FLAG_SET(session->flags, SESSION_FLAG_KEEP_ALIVE);
             // add header
-            set_response_header(&session->context, "Connection", "Keep-Alive");
+            set_response_header(&session->context, "Connection", "keep-alive");
             set_response_header(&session->context, "Keep-Alive", SESSION_KEEP_ALIVE_TIMEOUT_RESPONSE);
             return;
         }
     }
     FLAG_CLEAR(session->flags, SESSION_FLAG_KEEP_ALIVE);
-    set_response_header(&session->context, "Connection", "Close");
+    set_response_header(&session->context, "Connection", "close");
 }
 
 void nh_session_read(nh_session_t *session) {
     session->state = SESSION_READ;
     session->timeout = SESSION_TIMEOUT;
+    nh_context_clear(&session->context);
 
     if (nh_read_socket(&session->context.raw, session->socket) == 0) {
         session->state = SESSION_END;
         return;
     }
-
     // init response
     session->context.response = (nh_response_t) {};
 
@@ -633,9 +643,7 @@ void nh_session_write(nh_session_t *session) {
         return;
     }
 
-
     if (FLAG_CHECK(session->flags, SESSION_FLAG_KEEP_ALIVE)) {
-        nh_context_clear(&session->context);
         session->state = SESSION_READ;
         session->timeout = SESSION_KEEP_ALIVE_TIMEOUT;
     } else {
@@ -697,8 +705,11 @@ void nh_session_event_timer_cb(struct epoll_event *ev) {
     // data.ptr - sizeof(ev_handler_t) = &session
     nh_session_t *session = (nh_session_t *) (ev->data.ptr - sizeof(ev_handler_t));
     uint64_t res;
-    session->timeout -= 1;
-    if (session->timeout == 0) nh_session_free(session);
+    read(session->timer_fd, &res, sizeof(res));
+    session->timeout -= 2;
+    if (session->timeout <= 0) {
+        nh_session_free(session);
+    }
 }
 
 void nh_session_register_events(nh_session_t *session) {
@@ -714,8 +725,8 @@ void nh_session_register_events(nh_session_t *session) {
     // init timer
     int timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
     struct itimerspec ts = {};
-    ts.it_value.tv_sec = 1;
-    ts.it_interval.tv_sec = 1;
+    ts.it_value.tv_sec = 2;
+    ts.it_interval.tv_sec = 2;
     timerfd_settime(timer_fd, 0, &ts, NIL);
 
     session->timer_fd = timer_fd;
@@ -776,8 +787,8 @@ int httpserver_listen(httpserver_t *server, int port) {
 int httpserver_listen_ip(httpserver_t *server, const char *ip, int port) {
     nh_server_listen(server, ip, port);
     struct epoll_event ev_list[1];
-    while (1) {
-        int events = epoll_wait(server->loop, ev_list, 1, -1);
+    int events;
+    while ((events = epoll_wait(server->loop, ev_list, 1, -1)) > -1) {
         for (int i = 0; i < events; i++) {
             ev_cb_t *ev_cb = (ev_cb_t *) ev_list[i].data.ptr;
             ev_cb->handler(&ev_list[i]);
