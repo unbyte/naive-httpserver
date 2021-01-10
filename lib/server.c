@@ -146,6 +146,7 @@ typedef enum {
 typedef enum {
     PARSE_METHOD, PARSE_PATH, PARSE_VERSION,
     PARSE_HEADER,
+    PARSE_SECOND_LINE_END,
     PARSE_BODY,
     PARSE_LINE_END,
     PARSE_DONE,
@@ -157,10 +158,16 @@ struct http_context_s {
     nh_anchor_t path;
     nh_anchor_t body;
     nh_kv_anchor_t *header;
+
     uint32_t header_len;
     uint32_t header_capacity;
+
+    uint32_t body_len;
+    // raw stream
     nh_stream_t raw;
+    // parse
     nh_http_parse_state parse_state;
+
     nh_response_t response;
 };
 
@@ -423,6 +430,9 @@ int nh_http_parse_consume_header(http_context_t *ctx);
 // help parse body in http request, return 0 means not complete
 int nh_http_parse_consume_body(http_context_t *ctx);
 
+// help get content-length
+void nh_http_parse_get_body_len(http_context_t *ctx);
+
 // parse http request
 int nh_http_parse(http_context_t *ctx);
 
@@ -500,23 +510,27 @@ int nh_http_parse_consume_header(http_context_t *ctx) {
     return 1;
 }
 
-int nh_http_parse_consume_body(http_context_t *ctx) {
+void nh_http_parse_get_body_len(http_context_t *ctx) {
     http_string_t length_str = get_request_header(ctx, "Content-Length");
-    if (length_str.len == 0) return 1;
-    uint32_t length = nh_string_to_uint(length_str);
-    if (length <= 0) return 1;
+    if (length_str.len == 0) {
+        ctx->body_len = 0;
+    } else {
+        uint32_t length = nh_string_to_uint(length_str);
+        ctx->body_len = length > 0 ? length : 0;
+    }
+}
 
+int nh_http_parse_consume_body(http_context_t *ctx) {
+    uint32_t length = ctx->body_len;
     nh_stream_t *stream = &ctx->raw;
     if (ctx->body.index == 0) ctx->body.index = stream->index;
-    if (stream->length - stream->index > length) {
+    if (stream->length - ctx->body.index > length) {
         ctx->body.len = length;
-        stream->index += length;
     } else if (ctx->body.len < length) {
         ctx->body.len = stream->length - ctx->body.index;
-        stream->index = stream->length;
     }
+    stream->index = ctx->body.index + ctx->body.len;
     return ctx->body.len == length;
-//    return 1;
 }
 
 // 0 means error, -1 means not complete, 1 means success and complete
@@ -564,23 +578,28 @@ int nh_http_parse(http_context_t *ctx) {
             case PARSE_LINE_END:
                 if (!nh_string_cmp("\r\n", &stream->buf[stream->index], 2)) return 0;
                 stream->index += 2;
-                if (nh_string_cmp("\r\n", &stream->buf[stream->index], 2)) {
-                    // no head, parse body directly
-                    stream->index += 2;
-                    ctx->parse_state = stream->index == stream->length ? PARSE_DONE : PARSE_BODY;
-                } else {
-                    ctx->parse_state = PARSE_HEADER;
-                }
+                ctx->parse_state = PARSE_SECOND_LINE_END;
                 break;
+            case PARSE_SECOND_LINE_END:
+                if (!nh_string_cmp("\r\n", &stream->buf[stream->index], 2)) {
+                    ctx->parse_state = PARSE_HEADER;
+                    break;
+                }
+                // parse body
+                stream->index += 2;
+                ctx->parse_state = PARSE_BODY;
+                // get body length before consume body
+                nh_http_parse_get_body_len(ctx);
+                // fallthrough
             case PARSE_BODY:
-                if (nh_http_parse_consume_body(ctx))ctx->parse_state = PARSE_DONE;
+                if (nh_http_parse_consume_body(ctx)) ctx->parse_state = PARSE_DONE;
                 break;
             case PARSE_HEADER:
                 if (!nh_http_parse_consume_header(ctx)) return 0;
                 ctx->parse_state = PARSE_LINE_END;
                 break;
-            default:
-                break;
+            case PARSE_DONE:
+                return 1;
         }
     }
     return 1;
@@ -632,7 +651,6 @@ void nh_session_pre_handler(nh_session_t *session) {
 void nh_session_read(nh_session_t *session) {
     session->state = SESSION_READ;
     session->timeout = SESSION_TIMEOUT;
-
     if (nh_read_socket(&session->context.raw, session->socket) == 0) {
         session->state = SESSION_END;
         return;
@@ -640,7 +658,6 @@ void nh_session_read(nh_session_t *session) {
 
     int result = nh_http_parse(&session->context);
     if (session->context.parse_state != PARSE_DONE) return;
-
     if (result) {
         // success, process
         nh_session_pre_handler(session);
