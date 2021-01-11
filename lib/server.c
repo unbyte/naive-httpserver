@@ -14,9 +14,8 @@
 
 #define LOWER_CHAR(c) (c >= 'A' && c <= 'Z' ? c + 32 : c)
 
-#define SESSION_TIMEOUT 10
-#define SESSION_KEEP_ALIVE_TIMEOUT 30
-#define SESSION_KEEP_ALIVE_TIMEOUT_RESPONSE "timeout=30, max=1000"
+#define DEFAULT_TIMEOUT 10
+#define DEFAULT_KEEP_ALIVE_TIMEOUT 30
 
 #define REQUEST_BUFFER_SIZE (1<<10)
 #define MAX_REQUEST_BUFFER_SIZE (1<<23)
@@ -172,6 +171,21 @@ struct http_context_s {
 };
 
 typedef struct {
+    // for accepting and handling sessions
+    ev_handler_t handler;
+    int socket;
+    int loop;
+
+    void (*request_handler)(http_context_t *);
+
+    struct sockaddr_in addr;
+    socklen_t addr_len;
+
+    uint32_t timeout;
+    uint32_t keep_alive_timeout;
+} httpserver_t;
+
+typedef struct {
     // for processing sessions
     ev_handler_t handler;
     ev_handler_t timer_handler;
@@ -184,18 +198,6 @@ typedef struct {
 
     httpserver_t *server;
 } nh_session_t;
-
-struct httpserver_s {
-    // for accepting and handling sessions
-    ev_handler_t handler;
-    int socket;
-    int loop;
-
-    void (*request_handler)(http_context_t *);
-
-    struct sockaddr_in addr;
-    socklen_t addr_len;
-};
 
 /**
  * Internal Utils
@@ -640,7 +642,6 @@ void nh_session_pre_handler(nh_session_t *session) {
             FLAG_SET(session->flags, SESSION_FLAG_KEEP_ALIVE);
             // add header
             set_response_header(&session->context, "Connection", "keep-alive");
-            set_response_header(&session->context, "Keep-Alive", SESSION_KEEP_ALIVE_TIMEOUT_RESPONSE);
             return;
         }
     }
@@ -650,7 +651,7 @@ void nh_session_pre_handler(nh_session_t *session) {
 
 void nh_session_read(nh_session_t *session) {
     session->state = SESSION_READ;
-    session->timeout = SESSION_TIMEOUT;
+    session->timeout = session->server->timeout;
     if (nh_read_socket(&session->context.raw, session->socket) == 0) {
         session->state = SESSION_END;
         return;
@@ -693,7 +694,7 @@ void nh_session_write(nh_session_t *session) {
     if (FLAG_CHECK(session->flags, SESSION_FLAG_KEEP_ALIVE)) {
         nh_context_clear(&session->context);
         session->state = SESSION_READ;
-        session->timeout = SESSION_KEEP_ALIVE_TIMEOUT;
+        session->timeout = session->server->keep_alive_timeout;
     } else {
         session->state = SESSION_END;
     }
@@ -733,7 +734,7 @@ void nh_server_events_cb(struct epoll_event *ev) {
         nh_session_t *session = (nh_session_t *) calloc(1, sizeof(nh_session_t));
         assert(session != NIL);
         session->socket = socket;
-        session->timeout = SESSION_TIMEOUT;
+        session->timeout = server->timeout;
         session->handler = nh_session_event_cb;
         session->server = server;
         // add events on epoll
@@ -818,21 +819,17 @@ void nh_server_listen(httpserver_t *server, char const *ip, int port) {
  * Entry Implement
  **/
 
-httpserver_t *httpserver_init(void (*handler)(http_context_t *)) {
+int httpserver_listen(httpserver_option_t option) {
     httpserver_t *server = (httpserver_t *) malloc(sizeof(httpserver_t));
     assert(server != NIL);
     server->handler = nh_server_events_cb;
-    server->request_handler = handler;
+    server->request_handler = option.handler;
+    server->timeout = option.timeout > 0 ? option.timeout : DEFAULT_TIMEOUT;
+    server->keep_alive_timeout = option.keep_alive_timeout > 0 ? option.keep_alive_timeout : DEFAULT_KEEP_ALIVE_TIMEOUT;
     server->loop = epoll_create1(0);
-    return server;
-}
 
-int httpserver_listen(httpserver_t *server, int port) {
-    return httpserver_listen_ip(server, NIL, port);
-}
+    nh_server_listen(server, option.ip_addr, option.port);
 
-int httpserver_listen_ip(httpserver_t *server, const char *ip, int port) {
-    nh_server_listen(server, ip, port);
     struct epoll_event ev_list[1];
     int events;
     while ((events = epoll_wait(server->loop, ev_list, 1, -1)) > -1) {

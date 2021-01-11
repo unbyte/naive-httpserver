@@ -18,19 +18,22 @@ typedef struct {
 typedef struct http_context_s http_context_t;
 struct http_context_s;
 
-typedef struct httpserver_s httpserver_t;
-struct httpserver_s;
+typedef struct {
+    void (*handler)(http_context_t *);
+
+    uint32_t timeout;
+    uint32_t keep_alive_timeout;
+
+    char *ip_addr;
+    int port;
+} httpserver_option_t;
 
 /**
  * Exported Functions
 **/
 
 /** MAIN ENTRY **/
-httpserver_t *httpserver_init(void (*handler)(http_context_t *));
-
-int httpserver_listen(httpserver_t *server, int port);
-
-int httpserver_listen_ip(httpserver_t *server, char const *ip, int port);
+int httpserver_listen(httpserver_option_t server);
 
 /** REQUEST UTILS **/
 http_string_t get_request_header(http_context_t *ctx, const char *key);
