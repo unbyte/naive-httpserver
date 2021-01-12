@@ -10,7 +10,12 @@ set(CMAKE_C_FLAGS "-Wall -Wextra -lssl -lcrypto")
 set(CMAKE_C_FLAGS_DEBUG "-g")
 set(CMAKE_C_FLAGS_RELEASE "-O3")
 
-add_executable(naive-httpserver
-        src/main.c
+add_executable(example_http
+        examples/http/main.c
+        lib/server.c
+        lib/server.h)
+
+add_executable(example_ws
+        examples/websocket/main.c
         lib/server.c
         lib/server.h)

@@ -1,22 +1,5 @@
-#include "../lib/server.h"
-
-void ws_connect_handler(ws_session_t *session) {
-    printf("connected\n");
-}
-
-void ws_message_handler(ws_context_t *ctx, ws_session_t *session) {
-    websocket_emit_text(session, 12, "have message");
-}
-
-void ws_close_handler(ws_session_t *session) {
-    printf("closed!\n");
-}
-
-ws_handler_t *handlers = &(ws_handler_t) {
-    .on_message = ws_message_handler,
-    .on_close = ws_close_handler,
-    .on_connect = ws_connect_handler,
-};
+#define DISABLE_WEBSOCKET
+#include "server.h"
 
 void handler(http_context_t *ctx) {
     http_string_t path = get_request_path(ctx);
@@ -30,10 +13,6 @@ void handler(http_context_t *ctx) {
     if (string_cmp_chars(method, "POST") && string_cmp_chars(path, "/echo")) {
         set_response_status(ctx, 200);
         set_response_body_string(ctx, get_request_body(ctx));
-        return;
-    }
-    if (string_cmp_chars(path, "/ws")) {
-        websocket_serve(ctx, handlers);
         return;
     }
     set_response_status(ctx, 404);

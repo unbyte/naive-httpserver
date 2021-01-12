@@ -1030,16 +1030,17 @@ size_t nh_base64_encode(const unsigned char *src, size_t src_len, unsigned char 
 
 void nh_ws_context_free(ws_context_t *ctx) {
     nh_stream_free(&ctx->stream);
+    if (ctx->frame.payload != NULL) free(ctx->frame.payload);
     free(ctx);
 }
 
 void nh_ws_out_context_free(nh_ws_out_context_t *ctx) {
     nh_stream_free(&ctx->stream);
+    if (ctx->frame.payload != NULL) free(ctx->frame.payload);
     free(ctx);
 }
 
 void nh_ws_session_free(ws_session_t *session) {
-    printf("freed\n");
     // unregister events
     epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->socket, NULL);
     epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->timer_fd, NULL);
@@ -1067,6 +1068,7 @@ void nh_ws_session_free(ws_session_t *session) {
 int nh_ws_handshake(http_context_t *context) {
     http_string_t key;
     if (context->version == HTTP_1_0
+        || !string_cmp_chars_case_insensitive(get_request_method(context), "GET")
         || !string_cmp_chars_case_insensitive(get_request_header(context, "Connection"), "upgrade")
         || !string_cmp_chars_case_insensitive(get_request_header(context, "Upgrade"), "websocket")
         || !string_cmp_chars_case_insensitive(get_request_header(context, "Sec-WebSocket-Version"), "13")
@@ -1187,9 +1189,15 @@ void nh_ws_parse(ws_context_t *ctx) {
 }
 
 void nh_ws_on_close_handler(ws_context_t *ctx, ws_session_t *session) {
+    FLAG_SET(session->flags, WEBSOCKET_SESSION_CLOSE);
     unsigned char *status = malloc(sizeof(unsigned char) * 2);
+    void *tmp;
+    if ((tmp = websocket_store_get(session, 0)) != NULL) {
+        free(tmp);
+    }
+    websocket_store_set(session, 0, status);
     status[0] = 0x03;
-    if (ctx->frame.payload_length > 0) {
+    if (ctx == NULL || ctx->frame.payload_length > 0) {
         status[1] = 0xe8;
         nh_ws_emit(session, 2, (char *) status, WEBSOCKET_OP_CLOSE);
     } else {
@@ -1217,9 +1225,9 @@ void nh_ws_recv_handler(ws_session_t *session) {
         ctx = session->incomplete_recv;
         nh_stream_copy(&ctx->stream, stream.buf, stream.length);
     } else {
-        ctx = malloc(sizeof(ws_context_t));
+        ctx = calloc(1, sizeof(ws_context_t));
         *ctx = (ws_context_t) {
-            .stream = stream
+            .stream = stream,
         };
     }
     // parse
@@ -1238,7 +1246,6 @@ void nh_ws_recv_handler(ws_session_t *session) {
             break;
         case WEBSOCKET_OP_CLOSE:
             // on_close callback
-            FLAG_SET(session->flags, WEBSOCKET_SESSION_CLOSE);
             if (session->ws_handlers->on_close != NULL) session->ws_handlers->on_close(session);
             nh_ws_on_close_handler(ctx, session);
             return;
@@ -1333,6 +1340,7 @@ ws_session_t *nh_ws_session_init(nh_session_t *session, ws_handler_t *handlers) 
         .socket = session->socket,
         .timer_fd = session->timer_fd,
         .timeout = WEBSOCKET_TIMEOUT,
+        .store = {0}
     };
 
     // remove socket from epoll
@@ -1351,13 +1359,17 @@ ws_session_t *nh_ws_session_init(nh_session_t *session, ws_handler_t *handlers) 
 
 void nh_ws_emit(ws_session_t *session, uint32_t payload_len, char *payload, unsigned char op) {
     nh_ws_out_context_t *ctx = malloc(sizeof(nh_ws_out_context_t));
+    // copy payload
+    char *payload_copy = malloc(sizeof(char) * payload_len);
+    memcpy(payload_copy, payload, payload_len);
     *ctx = (nh_ws_out_context_t) {
         .frame = (nh_ws_frame) {
             .payload_length = payload_len,
-            .payload = payload,
+            .payload = payload_copy,
             .opcode = op,
         },
-        .stream = {0}
+        .stream = {0},
+        .next = NULL,
     };
     nh_stream_init(&ctx->stream);
     nh_ws_generate_emit_stream(ctx);
@@ -1381,7 +1393,7 @@ void *websocket_store_get(ws_session_t *session, uint16_t index) {
 
 void websocket_store_set(ws_session_t *session, uint16_t index, void *value) {
     if (session->store.items == NULL) {
-        session->store.items = (void **) malloc(sizeof(void *) * REQUEST_HEADER_INIT_SIZE);
+        session->store.items = (void **) calloc(1, sizeof(void *) * REQUEST_HEADER_INIT_SIZE);
         session->store.capacity = WEBSOCKET_CONTEXT_STORE_INIT;
     }
 
@@ -1403,6 +1415,10 @@ http_string_t websocket_get_payload(ws_context_t *ctx) {
 
 unsigned char websocket_get_opcode(ws_context_t *ctx) {
     return ctx->frame.opcode;
+}
+
+void websocket_close(ws_session_t *session) {
+    nh_ws_on_close_handler(NULL, session);
 }
 
 void websocket_emit_binary(ws_session_t *session, uint32_t payload_len, char payload[payload_len]) {

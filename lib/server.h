@@ -88,6 +88,8 @@ void websocket_emit_binary(ws_session_t *session, uint32_t payload_len, char pay
 
 void websocket_emit_text(ws_session_t *session, uint32_t payload_len, char payload[payload_len]);
 
+void websocket_close(ws_session_t *session);
+
 void *websocket_store_get(ws_session_t *session, uint16_t index);
 
 void websocket_store_set(ws_session_t *session, uint16_t index, void *value);
@@ -95,7 +97,6 @@ void websocket_store_set(ws_session_t *session, uint16_t index, void *value);
 http_string_t websocket_get_payload(ws_context_t *ctx);
 
 unsigned char websocket_get_opcode(ws_context_t *ctx);
-
 
 #endif
 
