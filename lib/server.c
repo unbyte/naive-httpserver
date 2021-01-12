@@ -13,7 +13,7 @@
 #define LOWER_CHAR(c) (c <= 'Z' && c >= 'A' ? c + 32 : c)
 
 #define DEFAULT_TIMEOUT 10
-#define WEBSOCKET_TIMEOUT 3600
+#define WEBSOCKET_TIMEOUT 120
 
 #define REQUEST_BUFFER_SIZE (1<<10)
 #define MAX_REQUEST_BUFFER_SIZE (1<<23)
@@ -162,10 +162,11 @@ struct http_context_s {
     nh_anchor_t method;
     nh_anchor_t path;
     nh_anchor_t body;
-    nh_kv_anchor_t *header;
-
-    uint32_t header_len;
-    uint32_t header_capacity;
+    struct {
+        nh_kv_anchor_t *items;
+        uint32_t capacity;
+        uint32_t length;
+    } header;
 
     uint32_t body_len;
     // raw stream
@@ -258,7 +259,7 @@ uint32_t nh_string_to_uint(http_string_t string) {
 }
 
 void nh_context_clear(http_context_t *ctx) {
-    if (ctx->header != NULL) free(ctx->header);
+    if (ctx->header.items != NULL) free(ctx->header.items);
 
     nh_header_t *header = ctx->response.header;
     nh_header_t *temp_h;
@@ -369,8 +370,8 @@ void nh_stream_copy(nh_stream_t *stream, char const src[static 1], uint32_t size
 http_string_t get_request_header(http_context_t *ctx, char const key[static 1]) {
     size_t len = strlen(key);
     nh_kv_anchor_t cur;
-    for (uint32_t i = 0; i < ctx->header_len; ++i) {
-        cur = ctx->header[i];
+    for (uint32_t i = 0; i < ctx->header.length; ++i) {
+        cur = ctx->header.items[i];
         if (cur.key.len == len && nh_string_cmp_case_insensitive(key, &ctx->raw.buf[cur.key.index], len)) {
             return (http_string_t) {
                 .value = &ctx->raw.buf[cur.value.index],
@@ -442,13 +443,13 @@ int string_cmp_chars_case_insensitive(http_string_t string, char const chars[sta
     return strlen(chars) == string.len && nh_string_cmp_case_insensitive(string.value, chars, string.len);
 }
 
-void *malloc_on_context(http_context_t *ctx, size_t size) {
+void *bind_with_context(http_context_t *ctx, void *ptr) {
     nh_malloced_t *m = (nh_malloced_t *) malloc(sizeof(nh_malloced_t));
     assert(m != NULL);
-    m->ptr = malloc(size);
+    m->ptr = ptr;
     m->next = ctx->malloced;
     ctx->malloced = m;
-    return m->ptr;
+    return ptr;
 }
 
 /**
@@ -508,10 +509,10 @@ void nh_server_listen(nh_server_t *server, char const *ip, int port);
 **/
 
 int nh_http_parse_consume_header(http_context_t *ctx) {
-    if (ctx->header == NULL) {
-        ctx->header = (nh_kv_anchor_t *) malloc(sizeof(nh_kv_anchor_t) * REQUEST_HEADER_INIT_SIZE);
-        ctx->header_capacity = REQUEST_HEADER_INIT_SIZE;
-        ctx->header_len = 0;
+    if (ctx->header.items == NULL) {
+        ctx->header.items = (nh_kv_anchor_t *) malloc(sizeof(nh_kv_anchor_t) * REQUEST_HEADER_INIT_SIZE);
+        ctx->header.capacity = REQUEST_HEADER_INIT_SIZE;
+        ctx->header.length = 0;
     }
 
     nh_stream_t *stream = &ctx->raw;
@@ -527,17 +528,18 @@ int nh_http_parse_consume_header(http_context_t *ctx) {
 
     stream->index += value_offset;
 
-    if (ctx->header_len == ctx->header_capacity) {
-        ctx->header_capacity *= 2;
-        ctx->header = (nh_kv_anchor_t *) realloc(ctx->header, ctx->header_capacity * sizeof(nh_kv_anchor_t));
-        assert(ctx->header != NULL);
+    if (ctx->header.length == ctx->header.capacity) {
+        ctx->header.capacity *= 2;
+        ctx->header.items = (nh_kv_anchor_t *) realloc(ctx->header.items,
+                                                       ctx->header.capacity * sizeof(nh_kv_anchor_t));
+        assert(ctx->header.items != NULL);
     }
 
-    ctx->header[ctx->header_len] = (nh_kv_anchor_t) {
+    ctx->header.items[ctx->header.length] = (nh_kv_anchor_t) {
         .key = {.index = key_index, .len = key_offset},
         .value = {.index = value_index, .len = value_offset}
     };
-    ctx->header_len++;
+    ctx->header.length++;
     return 1;
 }
 
@@ -718,9 +720,11 @@ void nh_session_write(nh_session_t *session) {
         epoll_ctl(session->server->loop, EPOLL_CTL_MOD, session->socket, &ev);
         return;
     }
+
     if (FLAG_CHECK(session->flags, SESSION_FLAG_UPGRADED)) {
-        // events will be handled by other protocols so just do noop
+        // events will be handled by other protocols so just free session and http context
         nh_context_clear(&session->context);
+        free(session);
         return;
     }
 
@@ -880,18 +884,118 @@ int httpserver_listen(httpserver_option_t option) {
  **/
 #ifndef DISABLE_WEBSOCKET
 
+#define WEBSOCKET_MAGIC_NUMBER "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#define WEBSOCKET_CONTEXT_STORE_INIT 2
+
+#define WEBSOCKET_OP_CONTINUE 0
+#define WEBSOCKET_OP_TEXT 1
+#define WEBSOCKET_OP_BIN 2
+#define WEBSOCKET_OP_CLOSE 8
+#define WEBSOCKET_OP_PING 9
+#define WEBSOCKET_OP_PONG 10
+
+#define WEBSOCKET_SESSION_CLOSE (1<<1)
+
 #include <openssl/sha.h>
 
-#define WEBSOCKET_MAGIC_NUMBER "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+/*
+ * Declare
+ **/
 
+typedef enum {
+    PARSE_WS_HEAD,
+    PARSE_WS_PAYLOAD,
+    PARSE_WS_DONE
+} nh_ws_parse_state;
+
+typedef struct {
+    unsigned char fin;
+    unsigned char opcode;
+    unsigned char mask;
+    uint64_t payload_length;
+    unsigned char masking_key[4];
+    char *payload;
+    uint64_t payload_consumed_length;
+} nh_ws_frame;
+
+// inbound message context
 struct ws_context_s {
-    ev_handler_t handler;
-    nh_session_t *session;
+    nh_stream_t stream;
+    nh_ws_frame frame;
+    nh_ws_parse_state parse_state;
 };
 
-unsigned char const base64_table[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+// outbound message context in private
+typedef struct nh_ws_out_context_s nh_ws_out_context_t;
+struct nh_ws_out_context_s {
+    nh_stream_t stream;
+    nh_ws_frame frame;
+    nh_ws_out_context_t *next;
+};
 
-size_t base64_encode(unsigned char const src[static 1], size_t src_len, unsigned char dest[static 1]) {
+struct ws_session_s {
+    ev_handler_t handler;
+    ev_handler_t timer_handler;
+    ev_handler_t emit_handler;
+    int socket;
+    int timer_fd;
+    nh_server_t *server;
+    uint16_t timeout;
+    struct {
+        void **items;
+        uint32_t capacity;
+    } store;
+    ws_handler_t *ws_handlers;
+
+    ws_context_t *incomplete_recv;
+    nh_ws_out_context_t *incomplete_emit;
+    nh_ws_out_context_t *incomplete_emit_tail;
+    uint8_t flags;
+};
+
+size_t nh_base64_encode(const unsigned char *src, size_t src_len, unsigned char *dest);
+
+void nh_reverse_endian(char string[static 1], size_t len);
+
+void nh_umask(unsigned char data[static 1], size_t len, unsigned char const mask_key[static 1]);
+
+void nh_ws_context_free(ws_context_t *ctx);
+
+void nh_ws_out_context_free(nh_ws_out_context_t *ctx);
+
+void nh_ws_session_free(ws_session_t *session);
+
+int nh_ws_handshake(http_context_t *context);
+
+void nh_ws_parse(ws_context_t *ctx);
+
+void nh_ws_on_close_handler(ws_context_t *ctx, ws_session_t *session);
+
+void nh_ws_on_ping_handler(ws_context_t *ctx, ws_session_t *session);
+
+void nh_ws_recv_handler(ws_session_t *session);
+
+void nh_ws_generate_emit_stream(nh_ws_out_context_t *ctx);
+
+void nh_ws_emit_handler(ws_session_t *session);
+
+void nh_ws_recv_event_cb(struct epoll_event *ev);
+
+void nh_ws_emit_event_cb(struct epoll_event *ev);
+
+void nh_ws_event_timer_cb(struct epoll_event *ev);
+
+ws_session_t *nh_ws_session_init(nh_session_t *session, ws_handler_t *handlers);
+
+void nh_ws_emit(ws_session_t *session, uint32_t payload_len, char payload[payload_len], unsigned char op);
+
+/*
+ * Implement
+ **/
+
+unsigned char const nh_base64_table[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+size_t nh_base64_encode(const unsigned char *src, size_t src_len, unsigned char *dest) {
     // modified from http://web.mit.edu/freebsd/head/contrib/wpa/src/utils/base64.c
     size_t olen = src_len * 4 / 3 + 4; /* 3-byte blocks to 4-byte */
     olen++; /* nul termination */
@@ -901,21 +1005,21 @@ size_t base64_encode(unsigned char const src[static 1], size_t src_len, unsigned
     unsigned char const *in = src;
     unsigned char *pos = dest;
     while (end - in >= 3) {
-        *pos++ = base64_table[in[0] >> 2];
-        *pos++ = base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
-        *pos++ = base64_table[((in[1] & 0x0f) << 2) | (in[2] >> 6)];
-        *pos++ = base64_table[in[2] & 0x3f];
+        *pos++ = nh_base64_table[in[0] >> 2];
+        *pos++ = nh_base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
+        *pos++ = nh_base64_table[((in[1] & 0x0f) << 2) | (in[2] >> 6)];
+        *pos++ = nh_base64_table[in[2] & 0x3f];
         in += 3;
     }
 
     if (end - in) {
-        *pos++ = base64_table[in[0] >> 2];
+        *pos++ = nh_base64_table[in[0] >> 2];
         if (end - in == 1) {
-            *pos++ = base64_table[(in[0] & 0x03) << 4];
+            *pos++ = nh_base64_table[(in[0] & 0x03) << 4];
             *pos++ = '=';
         } else {
-            *pos++ = base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
-            *pos++ = base64_table[(in[1] & 0x0f) << 2];
+            *pos++ = nh_base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
+            *pos++ = nh_base64_table[(in[1] & 0x0f) << 2];
         }
         *pos++ = '=';
     }
@@ -924,8 +1028,43 @@ size_t base64_encode(unsigned char const src[static 1], size_t src_len, unsigned
     return pos - dest;
 }
 
+void nh_ws_context_free(ws_context_t *ctx) {
+    nh_stream_free(&ctx->stream);
+    free(ctx);
+}
+
+void nh_ws_out_context_free(nh_ws_out_context_t *ctx) {
+    nh_stream_free(&ctx->stream);
+    free(ctx);
+}
+
+void nh_ws_session_free(ws_session_t *session) {
+    printf("freed\n");
+    // unregister events
+    epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->socket, NULL);
+    epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->timer_fd, NULL);
+    // close fd
+    close(session->timer_fd);
+    shutdown(session->socket, SHUT_RDWR);
+    close(session->socket);
+    // free memory
+    if (session->store.capacity) {
+        for (size_t i = 0; i < session->store.capacity; ++i) {
+            if (session->store.items[i] != NULL) free(session->store.items[i]);
+        }
+        free(session->store.items);
+    }
+    if (session->incomplete_recv != NULL) nh_ws_context_free(session->incomplete_recv);
+    nh_ws_out_context_t *tmp_emit;
+    while ((tmp_emit = session->incomplete_emit) != NULL) {
+        session->incomplete_emit = tmp_emit->next;
+        nh_ws_out_context_free(tmp_emit);
+    }
+    free(session);
+}
+
 // 1 - success; 0 - fail
-int nh_ws_handle_handshake(http_context_t *context) {
+int nh_ws_handshake(http_context_t *context) {
     http_string_t key;
     if (context->version == HTTP_1_0
         || !string_cmp_chars_case_insensitive(get_request_header(context, "Connection"), "upgrade")
@@ -942,8 +1081,8 @@ int nh_ws_handle_handshake(http_context_t *context) {
     strncpy(raw, key.value, 24);
     strcpy(&raw[24], WEBSOCKET_MAGIC_NUMBER);
     SHA1((unsigned char const *) raw, 60, (unsigned char *) sha1_encoded);
-    char *result = (char *) malloc_on_context(context, sizeof(char) * 31);
-    base64_encode(sha1_encoded, SHA_DIGEST_LENGTH, (unsigned char *) result);
+    char *result = (char *) bind_with_context(context, malloc(sizeof(char) * 31));
+    nh_base64_encode(sha1_encoded, SHA_DIGEST_LENGTH, (unsigned char *) result);
     set_response_status(context, 101);
     set_response_header(context, "Upgrade", "websocket");
     set_response_header(context, "Connection", "Upgrade");
@@ -951,44 +1090,342 @@ int nh_ws_handle_handshake(http_context_t *context) {
     return 1;
 }
 
-
-void nh_ws_event_cb(struct epoll_event *ev) {
-
+void nh_reverse_endian(char string[static 1], size_t len) {
+    char temp;
+    for (size_t i = 0; i < len / 2; ++i) {
+        temp = *(string + i);
+        *(string + i) = *(string + len - i - 1);
+        *(string + len - i - 1) = temp;
+    }
 }
 
-ws_context_t *nh_ws_context_init(nh_session_t *session) {
-    ws_context_t *context = (ws_context_t *) calloc(1, sizeof(ws_context_t));
-    assert(context != NULL);
-    context->session = session;
-    context->handler = nh_ws_event_cb;
-    return context;
+void nh_umask(unsigned char data[static 1], size_t len, unsigned char const mask_key[static 1]) {
+    for (size_t i = 0; i < len; ++i) *(data + i) ^= *(mask_key + (i % 4));
 }
 
+void nh_ws_parse(ws_context_t *ctx) {
+    /**
+      0                   1                   2                   3
+      0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+     +-+-+-+-+-------+-+-------------+-------------------------------+
+     |F|R|R|R| opcode|M| Payload     |    Extended payload length    |
+     |I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
+     |N|V|V|V|       |S|             |   (if payload len==126/127)   |
+     | |1|2|3|       |K|             |                               |
+     +-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
+     |     Extended payload length continued, if payload len == 127  |
+     + - - - - - - - - - - - - - - - +-------------------------------+
+     |                               |Masking-key, if MASK set to 1  |
+     +-------------------------------+-------------------------------+
+     | Masking-key (continued)       |          Payload Data         |
+     +-------------------------------- - - - - - - - - - - - - - - - +
+     :                     Payload Data continued ...                :
+     + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+     |                     Payload Data continued ...                |
+     +---------------------------------------------------------------+
+     **/
 
-void nh_ws_register_events(nh_session_t *session, ws_context_t *context) {
-    // remove socket from epoll
-    epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->socket, NULL);
-    // keep timer on epoll and change timeout
+    nh_stream_t *stream = &ctx->stream;
+    // return if not complete
+    if (stream->length < 6) return;
+
+    nh_ws_frame *frame = &ctx->frame;
+    uint64_t need_len, remain_len;
+    switch (ctx->parse_state) {
+        case PARSE_WS_HEAD:
+            frame->fin = (stream->buf[0] & 0x80) == 0x80;
+            // skip parse RSV1~3
+            frame->opcode = stream->buf[0] & 0x0F;
+            stream->index = 1;
+            frame->mask = (stream->buf[1] & 0x80) == 0X80;
+            frame->payload_length = stream->buf[1] & 0x7F;
+            stream->index = 2;
+            if (frame->payload_length == 126) {
+                frame->payload_length = (stream->buf[stream->index] & 0xFF) << 8 |
+                                        (stream->buf[stream->index + 1] & 0xFF);
+                stream->index += 2;
+            } else if (frame->payload_length == 127) {
+                memcpy(&(frame->payload_length), &stream->buf[stream->index], 8);
+                nh_reverse_endian((char *) &frame->payload_length, 8);
+                stream->index += 8;
+            }
+            memcpy(&(frame->masking_key), &stream->buf[stream->index], 4);
+            stream->index += 4;
+
+            if (!frame->payload_length) {
+                ctx->parse_state = PARSE_WS_DONE;
+                return;
+            }
+            // prepare payload
+            frame->payload = malloc(sizeof(char) * frame->payload_length + 1);
+            frame->payload[frame->payload_length] = '\0';
+            ctx->parse_state = PARSE_WS_PAYLOAD;
+            // fallthrough
+        case PARSE_WS_PAYLOAD:
+            need_len = frame->payload_length - frame->payload_consumed_length;
+            remain_len = stream->length - stream->index;
+            if (remain_len < need_len) {
+                memcpy(&frame->payload[frame->payload_consumed_length],
+                       &stream->buf[stream->index],
+                       remain_len);
+                frame->payload_consumed_length = frame->payload_length;
+                stream->index += remain_len;
+                return;
+            }
+            memcpy(&frame->payload[frame->payload_consumed_length],
+                   &stream->buf[stream->index],
+                   need_len);
+            frame->payload_consumed_length = frame->payload_length;
+            stream->index += need_len;
+            ctx->parse_state = PARSE_WS_DONE;
+            // fallthrough
+        case PARSE_WS_DONE:
+            nh_umask((unsigned char *) frame->payload, frame->payload_length, frame->masking_key);
+            nh_stream_free(&ctx->stream);
+            break;
+    }
+}
+
+void nh_ws_on_close_handler(ws_context_t *ctx, ws_session_t *session) {
+    unsigned char *status = malloc(sizeof(unsigned char) * 2);
+    status[0] = 0x03;
+    if (ctx->frame.payload_length > 0) {
+        status[1] = 0xe8;
+        nh_ws_emit(session, 2, (char *) status, WEBSOCKET_OP_CLOSE);
+    } else {
+        status[1] = 0xed;
+        nh_ws_emit(session, 2, (char *) status, WEBSOCKET_OP_CLOSE);
+    }
+}
+
+void nh_ws_on_ping_handler(ws_context_t *ctx, ws_session_t *session) {
+    if (ctx->frame.payload_length > 0) {
+        nh_ws_emit(session, ctx->frame.payload_length, ctx->frame.payload, WEBSOCKET_OP_PONG);
+    } else {
+        nh_ws_emit(session, 0, NULL, WEBSOCKET_OP_PONG);
+    }
+}
+
+void nh_ws_recv_handler(ws_session_t *session) {
+    // check is closed
+    if (FLAG_CHECK(session->flags, WEBSOCKET_SESSION_CLOSE)) return;
+
+    nh_stream_t stream = {0};
+    if (nh_read_socket(&stream, session->socket) == 0) return;
+    ws_context_t *ctx;
+    if (session->incomplete_recv != NULL && session->incomplete_recv->parse_state != PARSE_WS_DONE) {
+        ctx = session->incomplete_recv;
+        nh_stream_copy(&ctx->stream, stream.buf, stream.length);
+    } else {
+        ctx = malloc(sizeof(ws_context_t));
+        *ctx = (ws_context_t) {
+            .stream = stream
+        };
+    }
+    // parse
+    nh_ws_parse(ctx);
+    if (ctx->parse_state != PARSE_WS_DONE) {
+        session->incomplete_recv = ctx;
+        return;
+    }
+    session->incomplete_recv = NULL;
+    // handle
+    // DO NOT SUPPORT FIN == 0 && OPCODE == %x0
+    switch (ctx->frame.opcode) {
+        case WEBSOCKET_OP_TEXT:
+        case WEBSOCKET_OP_BIN:
+            if (session->ws_handlers->on_message != NULL) session->ws_handlers->on_message(ctx, session);
+            break;
+        case WEBSOCKET_OP_CLOSE:
+            // on_close callback
+            FLAG_SET(session->flags, WEBSOCKET_SESSION_CLOSE);
+            if (session->ws_handlers->on_close != NULL) session->ws_handlers->on_close(session);
+            nh_ws_on_close_handler(ctx, session);
+            return;
+        case WEBSOCKET_OP_PING:
+            nh_ws_on_ping_handler(ctx, session);
+        case WEBSOCKET_OP_PONG:
+        case WEBSOCKET_OP_CONTINUE:
+        default:
+            break;
+    }
     session->timeout = WEBSOCKET_TIMEOUT;
+}
+
+void nh_ws_generate_emit_stream(nh_ws_out_context_t *ctx) {
+    nh_stream_t *stream = &ctx->stream;
+    nh_ws_frame *frame = &ctx->frame;
+
+    char fin_op = (char) (0x80 + frame->opcode);
+    if (frame->payload_length < 126) {
+        unsigned char const head[2] = {fin_op, frame->payload_length};
+        nh_stream_copy(stream, (char *) head, 2);
+    } else if (frame->payload_length < 0xFFFF) {
+        char const head[4] = {fin_op, 126,
+                              (char) (frame->payload_length >> 8 & 0xFF),
+                              (char) (frame->payload_length & 0xFF)};
+        nh_stream_copy(stream, head, 4);
+    } else {
+        char head[12] = {fin_op, 127};
+        memcpy(&head[2], &frame->payload_length, 8);
+        nh_reverse_endian(&head[2], 8);
+        nh_stream_copy(stream, head, 12);
+    }
+    if (frame->payload_length > 0) nh_stream_copy(stream, frame->payload, frame->payload_length);
+}
+
+void nh_ws_emit_handler(ws_session_t *session) {
+    nh_ws_out_context_t *ctx;
+    while ((ctx = session->incomplete_emit) != NULL) {
+        if (!nh_write_socket(&ctx->stream, session->socket)) {
+            // pipe error, cancel and close session
+            nh_ws_session_free(session);
+            return;
+        }
+
+        if (ctx->stream.index != ctx->stream.length) {
+            // need wait writable
+            struct epoll_event ev;
+            ev.events = EPOLLOUT | EPOLLET;
+            ev.data.ptr = &session->emit_handler;
+            epoll_ctl(session->server->loop, EPOLL_CTL_MOD, session->socket, &ev);
+            return;
+        }
+
+        // success and free memory
+        nh_ws_out_context_free(ctx);
+
+        if ((session->incomplete_emit = session->incomplete_emit->next) == NULL) {
+            // the last one
+            session->incomplete_emit_tail = NULL;
+            if (FLAG_CHECK(session->flags, WEBSOCKET_SESSION_CLOSE)) nh_ws_session_free(session);
+        }
+    }
+}
+
+void nh_ws_recv_event_cb(struct epoll_event *ev) {
+    nh_ws_recv_handler((ws_session_t *) ev->data.ptr);
+}
+
+void nh_ws_emit_event_cb(struct epoll_event *ev) {
+    nh_ws_emit_handler((ws_session_t *) ev->data.ptr - sizeof(ev_handler_t) * 2);
+}
+
+void nh_ws_event_timer_cb(struct epoll_event *ev) {
+    ws_session_t *session = (ws_session_t *) (ev->data.ptr - sizeof(ev_handler_t));
+    uint64_t res;
+    read(session->timer_fd, &res, sizeof(res));
+    if (--session->timeout == 0) {
+        nh_ws_session_free(session);
+    }
+}
+
+
+ws_session_t *nh_ws_session_init(nh_session_t *session, ws_handler_t *handlers) {
+    ws_session_t *ws_session = (ws_session_t *) calloc(1, sizeof(ws_session_t));
+    assert(ws_session != NULL);
+    *ws_session = (ws_session_t) {
+        .handler = nh_ws_recv_event_cb,
+        .timer_handler = nh_ws_event_timer_cb,
+        .emit_handler = nh_ws_emit_event_cb,
+        .ws_handlers = handlers,
+        .server = session->server,
+        .socket = session->socket,
+        .timer_fd = session->timer_fd,
+        .timeout = WEBSOCKET_TIMEOUT,
+    };
+
+    // remove socket from epoll
+    epoll_ctl(ws_session->server->loop, EPOLL_CTL_DEL, ws_session->socket, NULL);
+    epoll_ctl(ws_session->server->loop, EPOLL_CTL_DEL, ws_session->timer_fd, NULL);
     // add new events to epoll for socket
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLET;
-    ev.data.ptr = context;
-    epoll_ctl(session->server->loop, EPOLL_CTL_ADD, session->socket, &ev);
+    ev.data.ptr = ws_session;
+    epoll_ctl(ws_session->server->loop, EPOLL_CTL_ADD, ws_session->socket, &ev);
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.ptr = &ws_session->timer_handler;
+    epoll_ctl(ws_session->server->loop, EPOLL_CTL_ADD, ws_session->timer_fd, &ev);
+    return ws_session;
 }
 
-// ws_context_t will be returned for send message; return null pointer if fail to handshake
-ws_context_t *serve_websocket(http_context_t *context, void (*receiver)(ws_context_t *)) {
-    nh_session_t *session = context->session;
-    if (!nh_ws_handle_handshake(context)) return NULL;
-    // generate ws context
-    ws_context_t *ws_context = nh_ws_context_init(session);
-    // register epoll events based on old epoll events
-    nh_ws_register_events(session, ws_context);
-    // set flag upgraded
-    FLAG_SET(session->flags, SESSION_FLAG_UPGRADED);
+void nh_ws_emit(ws_session_t *session, uint32_t payload_len, char *payload, unsigned char op) {
+    nh_ws_out_context_t *ctx = malloc(sizeof(nh_ws_out_context_t));
+    *ctx = (nh_ws_out_context_t) {
+        .frame = (nh_ws_frame) {
+            .payload_length = payload_len,
+            .payload = payload,
+            .opcode = op,
+        },
+        .stream = {0}
+    };
+    nh_stream_init(&ctx->stream);
+    nh_ws_generate_emit_stream(ctx);
+    if (session->incomplete_emit != NULL) {
+        // append to emit queue
+        session->incomplete_emit_tail->next = ctx;
+        session->incomplete_emit_tail = ctx;
+        return;
+    } else {
+        session->incomplete_emit = session->incomplete_emit_tail = ctx;
+    }
+    nh_ws_emit_handler(session);
+}
 
-    return ws_context;
+/* Exported Functions */
+
+void *websocket_store_get(ws_session_t *session, uint16_t index) {
+    if (session->store.capacity <= index) return NULL;
+    return session->store.items[index];
+}
+
+void websocket_store_set(ws_session_t *session, uint16_t index, void *value) {
+    if (session->store.items == NULL) {
+        session->store.items = (void **) malloc(sizeof(void *) * REQUEST_HEADER_INIT_SIZE);
+        session->store.capacity = WEBSOCKET_CONTEXT_STORE_INIT;
+    }
+
+    if (session->store.capacity <= index) {
+        session->store.capacity = index + 1;
+        session->store.items = (void **) realloc(session->store.items, sizeof(void *) * session->store.capacity);
+        assert(session->store.items != NULL);
+    }
+
+    session->store.items[index] = value;
+}
+
+http_string_t websocket_get_payload(ws_context_t *ctx) {
+    return (http_string_t) {
+        .value = ctx->frame.payload,
+        .len = ctx->frame.payload_length,
+    };
+}
+
+unsigned char websocket_get_opcode(ws_context_t *ctx) {
+    return ctx->frame.opcode;
+}
+
+void websocket_emit_binary(ws_session_t *session, uint32_t payload_len, char payload[payload_len]) {
+    nh_ws_emit(session, payload_len, payload, WEBSOCKET_OP_BIN);
+}
+
+void websocket_emit_text(ws_session_t *session, uint32_t payload_len, char payload[payload_len]) {
+    nh_ws_emit(session, payload_len, payload, WEBSOCKET_OP_TEXT);
+}
+
+// ws_session_t will be returned for send message; return null pointer if fail to handshake
+ws_session_t *websocket_serve(http_context_t *ctx, ws_handler_t *handlers) {
+    if (!nh_ws_handshake(ctx)) return NULL;
+    // generate ws ctx
+    ws_session_t *ws_session = nh_ws_session_init(ctx->session, handlers);
+
+    // set flag upgraded
+    FLAG_SET(ctx->session->flags, SESSION_FLAG_UPGRADED);
+
+    // on_connect callback
+    if (ws_session->ws_handlers->on_connect != NULL) ws_session->ws_handlers->on_connect(ws_session);
+
+    return ws_session;
 }
 
 #endif

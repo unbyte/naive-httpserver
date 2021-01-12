@@ -64,14 +64,38 @@ int string_cmp_chars(http_string_t string, char const chars[static 1]);
 int string_cmp_chars_case_insensitive(http_string_t string, char const chars[static 1]);
 
 // auto free memory after responding
-void* malloc_on_context(http_context_t *ctx, size_t size);
+void *bind_with_context(http_context_t *ctx, void *ptr);
 
 /** EXTERNAL - WEBSOCKET UTILS **/
 #ifndef DISABLE_WEBSOCKET
+typedef struct ws_session_s ws_session_t;
+struct ws_session_s;
+
 typedef struct ws_context_s ws_context_t;
 struct ws_context_s;
 
-ws_context_t *serve_websocket(http_context_t *context, void (*receiver)(ws_context_t *));
+typedef struct ws_handler_s {
+    void (*on_connect)(ws_session_t *);
+
+    void (*on_message)(ws_context_t *, ws_session_t *);
+
+    void (*on_close)(ws_session_t *);
+} ws_handler_t;
+
+ws_session_t *websocket_serve(http_context_t *ctx, ws_handler_t *handlers);
+
+void websocket_emit_binary(ws_session_t *session, uint32_t payload_len, char payload[payload_len]);
+
+void websocket_emit_text(ws_session_t *session, uint32_t payload_len, char payload[payload_len]);
+
+void *websocket_store_get(ws_session_t *session, uint16_t index);
+
+void websocket_store_set(ws_session_t *session, uint16_t index, void *value);
+
+http_string_t websocket_get_payload(ws_context_t *ctx);
+
+unsigned char websocket_get_opcode(ws_context_t *ctx);
+
 
 #endif
 
