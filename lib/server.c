@@ -10,20 +10,18 @@
 #include <stdarg.h>
 #include "server.h"
 
-#define NIL ((void*)0)
-
-#define LOWER_CHAR(c) (c >= 'A' && c <= 'Z' ? c + 32 : c)
+#define LOWER_CHAR(c) (c <= 'Z' && c >= 'A' ? c + 32 : c)
 
 #define DEFAULT_TIMEOUT 10
-#define DEFAULT_KEEP_ALIVE_TIMEOUT 30
+#define WEBSOCKET_TIMEOUT 3600
 
 #define REQUEST_BUFFER_SIZE (1<<10)
 #define MAX_REQUEST_BUFFER_SIZE (1<<23)
 
 #define REQUEST_HEADER_INIT_SIZE (1<<3)
 
-
 #define SESSION_FLAG_KEEP_ALIVE (1<<1)
+#define SESSION_FLAG_UPGRADED (1<<2)
 
 #define FLAG_SET(v, flag) v |= flag
 #define FLAG_CLEAR(v, flag) v &= ~flag
@@ -137,6 +135,14 @@ typedef struct {
     nh_anchor_t value;
 } nh_kv_anchor_t;
 
+typedef struct nh_malloced_s {
+    char *ptr;
+    struct nh_malloced_s *next;
+} nh_malloced_t;
+
+typedef struct nh_session_s nh_session_t;
+typedef struct nh_server_s nh_server_t;
+
 typedef enum {
     HTTP_1_0,
     HTTP_1_1
@@ -168,9 +174,27 @@ struct http_context_s {
     nh_http_parse_state parse_state;
 
     nh_response_t response;
+    nh_session_t *session;
+
+    // memory malloced on context
+    nh_malloced_t *malloced;
 };
 
-typedef struct {
+struct nh_session_s {
+    // for processing sessions
+    ev_handler_t handler;
+    ev_handler_t timer_handler;
+    int socket;
+    int timer_fd;
+    nh_session_state_t state;
+    http_context_t context;
+    uint8_t flags;
+    uint16_t timeout;
+
+    nh_server_t *server;
+};
+
+struct nh_server_s {
     // for accepting and handling sessions
     ev_handler_t handler;
     int socket;
@@ -181,23 +205,9 @@ typedef struct {
     struct sockaddr_in addr;
     socklen_t addr_len;
 
-    uint32_t timeout;
-    uint32_t keep_alive_timeout;
-} httpserver_t;
-
-typedef struct {
-    // for processing sessions
-    ev_handler_t handler;
-    ev_handler_t timer_handler;
-    int socket;
-    int timer_fd;
-    nh_session_state_t state;
-    http_context_t context;
-    uint8_t flags;
-    uint8_t timeout;
-
-    httpserver_t *server;
-} nh_session_t;
+    uint16_t timeout;
+    uint16_t keep_alive_timeout;
+};
 
 /**
  * Internal Utils
@@ -218,24 +228,24 @@ int nh_string_cmp(char const a[static 1], char const b[static 1], int len) {
 }
 
 void nh_stream_free(nh_stream_t *stream) {
-    if (stream->buf != NIL) {
+    if (stream->buf != NULL) {
         free(stream->buf);
-        stream->buf = NIL;
+        stream->buf = NULL;
         stream->length = 0;
         stream->index = 0;
     }
 }
 
 void nh_stream_init(nh_stream_t *stream) {
-    if (stream->buf == NIL) {
+    if (stream->buf == NULL) {
         stream->buf = (char *) calloc(1, REQUEST_BUFFER_SIZE);
-        assert(stream->buf != NIL);
+        assert(stream->buf != NULL);
         stream->capacity = REQUEST_BUFFER_SIZE;
     }
 }
 
 uint32_t nh_string_to_uint(http_string_t string) {
-    if (string.value == NIL) {
+    if (string.value == NULL) {
         return 0;
     }
     uint32_t result = 0;
@@ -248,25 +258,31 @@ uint32_t nh_string_to_uint(http_string_t string) {
 }
 
 void nh_context_clear(http_context_t *ctx) {
-    if (ctx->header != NIL) {
-        free(ctx->header);
-        ctx->header = NIL;
-    }
+    if (ctx->header != NULL) free(ctx->header);
 
     nh_header_t *header = ctx->response.header;
-    nh_header_t *tmp;
-    while (header != NIL) {
-        tmp = header;
-        header = tmp->next;
-        free(tmp);
+    nh_header_t *temp_h;
+    while (header != NULL) {
+        temp_h = header;
+        header = temp_h->next;
+        free(temp_h);
     }
-    ctx->response.header = NIL;
+
+    nh_malloced_t *malloced = ctx->malloced;
+    nh_malloced_t *temp_m;
+    while (malloced != NULL) {
+        temp_m = malloced;
+        malloced = temp_m->next;
+        free(temp_m->ptr);
+        free(temp_m);
+    }
 
     nh_stream_free(&ctx->response.raw);
     nh_stream_free(&ctx->raw);
 
-    ctx->response = (nh_response_t) {};
-    ctx->parse_state = PARSE_METHOD;
+    *ctx = (http_context_t) {
+        .session = ctx->session
+    };
 }
 
 // returns 0 means no new bytes
@@ -283,7 +299,7 @@ int nh_read_socket(nh_stream_t *buf, int socket) {
                             ? MAX_REQUEST_BUFFER_SIZE
                             : buf->capacity * 2;
             buf->buf = (char *) realloc(buf->buf, buf->capacity);
-            assert(buf->buf != NIL);
+            assert(buf->buf != NULL);
         }
     }
     return bytes == 0 ? 0 : 1;
@@ -320,7 +336,7 @@ int nh_stream_find_next_char_tuple(nh_stream_t *stream, char const next[2], uint
     return -1;
 }
 
-void nh_stream_write(nh_stream_t *stream, char const *fmt, ...) {
+void nh_stream_write(nh_stream_t *stream, char const fmt[static 1], ...) {
     va_list args;
     va_start(args, fmt);
 
@@ -328,7 +344,7 @@ void nh_stream_write(nh_stream_t *stream, char const *fmt, ...) {
     if (bytes + stream->length > stream->capacity) {
         while (bytes + stream->length > stream->capacity) stream->capacity *= 2;
         stream->buf = (char *) realloc(stream->buf, stream->capacity);
-        assert(stream->buf != NIL);
+        assert(stream->buf != NULL);
         bytes += vsnprintf(stream->buf + stream->length, stream->capacity - stream->length, fmt, args);
     }
     stream->length += bytes;
@@ -340,7 +356,7 @@ void nh_stream_copy(nh_stream_t *stream, char const src[static 1], uint32_t size
     if (stream->length + size > stream->capacity) {
         stream->capacity = stream->length + size;
         stream->buf = (char *) realloc(stream->buf, stream->capacity);
-        assert(stream->buf != NIL);
+        assert(stream->buf != NULL);
     }
     memcpy(stream->buf + stream->length, src, size);
     stream->length += size;
@@ -350,7 +366,7 @@ void nh_stream_copy(nh_stream_t *stream, char const src[static 1], uint32_t size
  * Utils Implement
 **/
 
-http_string_t get_request_header(http_context_t *ctx, const char *key) {
+http_string_t get_request_header(http_context_t *ctx, char const key[static 1]) {
     size_t len = strlen(key);
     nh_kv_anchor_t cur;
     for (uint32_t i = 0; i < ctx->header_len; ++i) {
@@ -390,16 +406,16 @@ void set_response_status(http_context_t *ctx, uint16_t status) {
     ctx->response.status = status > 599 || status < 100 ? 500 : status;
 }
 
-void set_response_header(http_context_t *ctx, const char *key, const char *value) {
+void set_response_header(http_context_t *ctx, const char key[static 1], const char value[static 1]) {
     nh_header_t *h = (nh_header_t *) malloc(sizeof(nh_header_t));
-    assert(h != NIL);
+    assert(h != NULL);
     h->key = key;
     h->value = value;
     h->next = ctx->response.header;
     ctx->response.header = h;
 }
 
-void set_response_body(http_context_t *ctx, char const *body) {
+void set_response_body(http_context_t *ctx, char const body[static 1]) {
     ctx->response.body = (http_string_t) {
         .value = body,
         .len = strlen(body)
@@ -412,14 +428,27 @@ void set_response_body_string(http_context_t *ctx, http_string_t body) {
 
 char *string_to_chars(http_string_t string) {
     char *result = malloc(sizeof(char) * (string.len + 1));
-    assert(result != NIL);
+    assert(result != NULL);
     strcpy(result, string.value);
     result[string.len] = '\0';
     return result;
 }
 
-int string_cmp_chars(http_string_t string, char const *chars) {
+int string_cmp_chars(http_string_t string, char const chars[static 1]) {
     return strlen(chars) == string.len && nh_string_cmp(string.value, chars, string.len);
+}
+
+int string_cmp_chars_case_insensitive(http_string_t string, char const chars[static 1]) {
+    return strlen(chars) == string.len && nh_string_cmp_case_insensitive(string.value, chars, string.len);
+}
+
+void *malloc_on_context(http_context_t *ctx, size_t size) {
+    nh_malloced_t *m = (nh_malloced_t *) malloc(sizeof(nh_malloced_t));
+    assert(m != NULL);
+    m->ptr = malloc(size);
+    m->next = ctx->malloced;
+    ctx->malloced = m;
+    return m->ptr;
 }
 
 /**
@@ -451,7 +480,7 @@ void nh_session_write(nh_session_t *session);
 void nh_session_free(nh_session_t *session);
 
 // handler before user's
-void nh_session_pre_handler(nh_session_t *session);
+void nh_keep_alive_handler(http_context_t *context);
 
 // process session according to session state
 void nh_session_handler(nh_session_t *session);
@@ -472,14 +501,14 @@ void nh_server_events_cb(struct epoll_event *ev);
 void nh_server_bind(int socket, struct sockaddr_in *addr, const char *ip, int port);
 
 // add server events on epoll (accept)
-void nh_server_listen(httpserver_t *server, char const *ip, int port);
+void nh_server_listen(nh_server_t *server, char const *ip, int port);
 
 /**
  * Server Internal Function Implements
 **/
 
 int nh_http_parse_consume_header(http_context_t *ctx) {
-    if (ctx->header == NIL) {
+    if (ctx->header == NULL) {
         ctx->header = (nh_kv_anchor_t *) malloc(sizeof(nh_kv_anchor_t) * REQUEST_HEADER_INIT_SIZE);
         ctx->header_capacity = REQUEST_HEADER_INIT_SIZE;
         ctx->header_len = 0;
@@ -501,7 +530,7 @@ int nh_http_parse_consume_header(http_context_t *ctx) {
     if (ctx->header_len == ctx->header_capacity) {
         ctx->header_capacity *= 2;
         ctx->header = (nh_kv_anchor_t *) realloc(ctx->header, ctx->header_capacity * sizeof(nh_kv_anchor_t));
-        assert(ctx->header != NIL);
+        assert(ctx->header != NULL);
     }
 
     ctx->header[ctx->header_len] = (nh_kv_anchor_t) {
@@ -616,7 +645,7 @@ void nh_generate_http_response(http_context_t *ctx) {
 
     // headers
     nh_header_t *header = response->header;
-    while (header != NIL) {
+    while (header != NULL) {
         nh_stream_write(stream, "%s: %s\r\n", header->key, header->value);
         header = header->next;
     }
@@ -632,21 +661,20 @@ void nh_generate_http_response(http_context_t *ctx) {
     }
 }
 
-void nh_session_pre_handler(nh_session_t *session) {
+void nh_keep_alive_handler(http_context_t *context) {
+    if (FLAG_CHECK(context->session->flags, SESSION_FLAG_UPGRADED)) return;
     // just for keep alive now
-    // TODO add more feature
-    if (session->context.version == HTTP_1_1) {
-        http_string_t connection = get_request_header(&session->context, "Connection");
+    if (context->version == HTTP_1_1) {
+        http_string_t connection = get_request_header(context, "Connection");
         if (connection.len > 5) {
             // not "close"
-            FLAG_SET(session->flags, SESSION_FLAG_KEEP_ALIVE);
-            // add header
-            set_response_header(&session->context, "Connection", "keep-alive");
+            FLAG_SET(context->session->flags, SESSION_FLAG_KEEP_ALIVE);
+            set_response_header(context, "Connection", "keep-alive");
             return;
         }
     }
-    FLAG_CLEAR(session->flags, SESSION_FLAG_KEEP_ALIVE);
-    set_response_header(&session->context, "Connection", "close");
+    FLAG_CLEAR(context->session->flags, SESSION_FLAG_KEEP_ALIVE);
+    set_response_header(context, "Connection", "close");
 }
 
 void nh_session_read(nh_session_t *session) {
@@ -661,8 +689,8 @@ void nh_session_read(nh_session_t *session) {
     if (session->context.parse_state != PARSE_DONE) return;
     if (result) {
         // success, process
-        nh_session_pre_handler(session);
         session->server->request_handler(&session->context);
+        nh_keep_alive_handler(&session->context);
     } else {
         // fail, report error
         set_response_status(&session->context, 400);
@@ -690,6 +718,11 @@ void nh_session_write(nh_session_t *session) {
         epoll_ctl(session->server->loop, EPOLL_CTL_MOD, session->socket, &ev);
         return;
     }
+    if (FLAG_CHECK(session->flags, SESSION_FLAG_UPGRADED)) {
+        // events will be handled by other protocols so just do noop
+        nh_context_clear(&session->context);
+        return;
+    }
 
     if (FLAG_CHECK(session->flags, SESSION_FLAG_KEEP_ALIVE)) {
         nh_context_clear(&session->context);
@@ -702,8 +735,8 @@ void nh_session_write(nh_session_t *session) {
 
 void nh_session_free(nh_session_t *session) {
     // clear events
-    epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->socket, NIL);
-    epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->timer_fd, NIL);
+    epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->socket, NULL);
+    epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->timer_fd, NULL);
     // close fd
     close(session->timer_fd);
     close(session->socket);
@@ -727,16 +760,17 @@ void nh_session_handler(nh_session_t *session) {
 }
 
 void nh_server_events_cb(struct epoll_event *ev) {
-    httpserver_t *server = (httpserver_t *) ev->data.ptr;
+    nh_server_t *server = (nh_server_t *) ev->data.ptr;
     int socket;
     while ((socket = accept(server->socket, (struct sockaddr *) &server->addr, &server->addr_len)) > 0) {
         // init session
         nh_session_t *session = (nh_session_t *) calloc(1, sizeof(nh_session_t));
-        assert(session != NIL);
+        assert(session != NULL);
         session->socket = socket;
         session->timeout = server->timeout;
         session->handler = nh_session_event_cb;
         session->server = server;
+        session->context.session = session;
         // add events on epoll
         nh_session_register_events(session);
         // start process
@@ -775,7 +809,7 @@ void nh_session_register_events(nh_session_t *session) {
     struct itimerspec ts = {};
     ts.it_value.tv_sec = 1;
     ts.it_interval.tv_sec = 1;
-    timerfd_settime(timer_fd, 0, &ts, NIL);
+    timerfd_settime(timer_fd, 0, &ts, NULL);
 
     session->timer_fd = timer_fd;
     session->timer_handler = nh_session_event_timer_cb;
@@ -788,14 +822,14 @@ void nh_session_register_events(nh_session_t *session) {
 
 void nh_server_bind(int socket, struct sockaddr_in *addr, const char *ip, int port) {
     addr->sin_family = AF_INET;
-    addr->sin_addr.s_addr = ip == NIL ? INADDR_ANY : inet_addr(ip);
+    addr->sin_addr.s_addr = ip == NULL ? INADDR_ANY : inet_addr(ip);
     addr->sin_port = htons(port);
     if (bind(socket, (struct sockaddr *) addr, sizeof(struct sockaddr_in)) < 0) {
         exit(1);
     }
 }
 
-void nh_server_listen(httpserver_t *server, char const *ip, int port) {
+void nh_server_listen(nh_server_t *server, char const *ip, int port) {
     // socket init
     signal(SIGPIPE, SIG_IGN);
     server->socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -820,12 +854,12 @@ void nh_server_listen(httpserver_t *server, char const *ip, int port) {
  **/
 
 int httpserver_listen(httpserver_option_t option) {
-    httpserver_t *server = (httpserver_t *) malloc(sizeof(httpserver_t));
-    assert(server != NIL);
+    nh_server_t *server = (nh_server_t *) malloc(sizeof(nh_server_t));
+    assert(server != NULL);
     server->handler = nh_server_events_cb;
     server->request_handler = option.handler;
     server->timeout = option.timeout > 0 ? option.timeout : DEFAULT_TIMEOUT;
-    server->keep_alive_timeout = option.keep_alive_timeout > 0 ? option.keep_alive_timeout : DEFAULT_KEEP_ALIVE_TIMEOUT;
+    server->keep_alive_timeout = MAX(server->timeout, option.keep_alive_timeout);
     server->loop = epoll_create1(0);
 
     nh_server_listen(server, option.ip_addr, option.port);
@@ -840,3 +874,121 @@ int httpserver_listen(httpserver_option_t option) {
     }
     return 0;
 }
+
+/**
+ * External - Websocket Utils
+ **/
+#ifndef DISABLE_WEBSOCKET
+
+#include <openssl/sha.h>
+
+#define WEBSOCKET_MAGIC_NUMBER "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+struct ws_context_s {
+    ev_handler_t handler;
+    nh_session_t *session;
+};
+
+unsigned char const base64_table[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+size_t base64_encode(unsigned char const src[static 1], size_t src_len, unsigned char dest[static 1]) {
+    // modified from http://web.mit.edu/freebsd/head/contrib/wpa/src/utils/base64.c
+    size_t olen = src_len * 4 / 3 + 4; /* 3-byte blocks to 4-byte */
+    olen++; /* nul termination */
+    if (olen < src_len) return 0;
+
+    unsigned char const *end = src + src_len;
+    unsigned char const *in = src;
+    unsigned char *pos = dest;
+    while (end - in >= 3) {
+        *pos++ = base64_table[in[0] >> 2];
+        *pos++ = base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
+        *pos++ = base64_table[((in[1] & 0x0f) << 2) | (in[2] >> 6)];
+        *pos++ = base64_table[in[2] & 0x3f];
+        in += 3;
+    }
+
+    if (end - in) {
+        *pos++ = base64_table[in[0] >> 2];
+        if (end - in == 1) {
+            *pos++ = base64_table[(in[0] & 0x03) << 4];
+            *pos++ = '=';
+        } else {
+            *pos++ = base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
+            *pos++ = base64_table[(in[1] & 0x0f) << 2];
+        }
+        *pos++ = '=';
+    }
+
+    *pos = '\0';
+    return pos - dest;
+}
+
+// 1 - success; 0 - fail
+int nh_ws_handle_handshake(http_context_t *context) {
+    http_string_t key;
+    if (context->version == HTTP_1_0
+        || !string_cmp_chars_case_insensitive(get_request_header(context, "Connection"), "upgrade")
+        || !string_cmp_chars_case_insensitive(get_request_header(context, "Upgrade"), "websocket")
+        || !string_cmp_chars_case_insensitive(get_request_header(context, "Sec-WebSocket-Version"), "13")
+        // skip check about Sec-WebSocket-Protocol and Sec-WebSocket-Extension
+        // base64(16bit) = 24bit
+        || (key = get_request_header(context, "Sec-WebSocket-Key")).len != 24) {
+        set_response_status(context, 400);
+        return 0;
+    }
+    char raw[61] = {0};
+    unsigned char sha1_encoded[SHA_DIGEST_LENGTH + 1] = {0};
+    strncpy(raw, key.value, 24);
+    strcpy(&raw[24], WEBSOCKET_MAGIC_NUMBER);
+    SHA1((unsigned char const *) raw, 60, (unsigned char *) sha1_encoded);
+    char *result = (char *) malloc_on_context(context, sizeof(char) * 31);
+    base64_encode(sha1_encoded, SHA_DIGEST_LENGTH, (unsigned char *) result);
+    set_response_status(context, 101);
+    set_response_header(context, "Upgrade", "websocket");
+    set_response_header(context, "Connection", "Upgrade");
+    set_response_header(context, "Sec-WebSocket-Accept", result);
+    return 1;
+}
+
+
+void nh_ws_event_cb(struct epoll_event *ev) {
+
+}
+
+ws_context_t *nh_ws_context_init(nh_session_t *session) {
+    ws_context_t *context = (ws_context_t *) calloc(1, sizeof(ws_context_t));
+    assert(context != NULL);
+    context->session = session;
+    context->handler = nh_ws_event_cb;
+    return context;
+}
+
+
+void nh_ws_register_events(nh_session_t *session, ws_context_t *context) {
+    // remove socket from epoll
+    epoll_ctl(session->server->loop, EPOLL_CTL_DEL, session->socket, NULL);
+    // keep timer on epoll and change timeout
+    session->timeout = WEBSOCKET_TIMEOUT;
+    // add new events to epoll for socket
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.ptr = context;
+    epoll_ctl(session->server->loop, EPOLL_CTL_ADD, session->socket, &ev);
+}
+
+// ws_context_t will be returned for send message; return null pointer if fail to handshake
+ws_context_t *serve_websocket(http_context_t *context, void (*receiver)(ws_context_t *)) {
+    nh_session_t *session = context->session;
+    if (!nh_ws_handle_handshake(context)) return NULL;
+    // generate ws context
+    ws_context_t *ws_context = nh_ws_context_init(session);
+    // register epoll events based on old epoll events
+    nh_ws_register_events(session, ws_context);
+    // set flag upgraded
+    FLAG_SET(session->flags, SESSION_FLAG_UPGRADED);
+
+    return ws_context;
+}
+
+#endif
