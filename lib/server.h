@@ -75,11 +75,13 @@ typedef struct ws_context_s ws_context_t;
 struct ws_context_s;
 
 typedef struct ws_handler_s {
-    void (*on_connect)(ws_session_t *);
+    void (*on_connected)(ws_session_t *);
 
     void (*on_message)(ws_context_t *, ws_session_t *);
 
     void (*on_close)(ws_session_t *);
+
+    void (*on_closed)(ws_session_t *);
 } ws_handler_t;
 
 ws_session_t *websocket_serve(http_context_t *ctx, ws_handler_t *handlers);

@@ -23,14 +23,14 @@ void ws_connect_handler(ws_session_t *session) {
     websocket_store_set(session, STORE_KEY_USER_ID, id);
 }
 
-void ws_close_handler(ws_session_t *session) {
+void ws_closed_handler(ws_session_t *session) {
     uint16_t *id = (uint16_t *) websocket_store_get(session, STORE_KEY_USER_ID);
     if (id == NULL) return;
     char buf[16];
     sprintf(buf, "#%u has quit", *id);
     room.users[*id] = NULL;
     for (uint16_t i = 0; i < room.users_count; ++i) {
-        if (i == *id || room.users[i] == NULL) continue;
+        if (room.users[i] == NULL) continue;
         websocket_emit_text(room.users[i], strlen(buf), buf);
     }
 }
@@ -40,7 +40,7 @@ void ws_message_handler(ws_context_t *ctx, ws_session_t *session) {
     if (id == NULL) return;
     http_string_t payload = websocket_get_payload(ctx);
     if (string_cmp_chars(payload, "quit")) {
-        ws_close_handler(session);
+        ws_closed_handler(session);
         websocket_close(session);
         return;
     }
@@ -56,8 +56,8 @@ void ws_message_handler(ws_context_t *ctx, ws_session_t *session) {
 
 ws_handler_t *handlers = &(ws_handler_t) {
     .on_message = ws_message_handler,
-    .on_close = ws_close_handler,
-    .on_connect = ws_connect_handler,
+    .on_closed = ws_closed_handler,
+    .on_connected = ws_connect_handler,
 };
 
 void handler(http_context_t *ctx) {

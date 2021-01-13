@@ -430,7 +430,7 @@ void set_response_body_string(http_context_t *ctx, http_string_t body) {
 char *string_to_chars(http_string_t string) {
     char *result = malloc(sizeof(char) * (string.len + 1));
     assert(result != NULL);
-    strcpy(result, string.value);
+    if (string.value != NULL) strcpy(result, string.value);
     result[string.len] = '\0';
     return result;
 }
@@ -907,6 +907,9 @@ int httpserver_listen(httpserver_option_t option) {
 
 #define WEBSOCKET_SESSION_CLOSE (1<<1)
 
+#define CALL_SESSION_CALLBACK(handler, session) do {if (handler != NULL) handler(session);} while(0)
+#define CALL_CONTEXT_CALLBACK(handler, ctx, session) do {if (handler != NULL) handler(ctx, session);} while(0)
+
 #include <openssl/sha.h>
 
 /*
@@ -1092,7 +1095,6 @@ int nh_ws_handshake(http_context_t *ctx) {
 
     // set flag upgraded
     FLAG_SET(ctx->session->flags, SESSION_FLAG_UPGRADED);
-
     char raw[61] = {0};
     unsigned char sha1_encoded[SHA_DIGEST_LENGTH + 1] = {0};
     strncpy(raw, key.value, 24);
@@ -1210,12 +1212,7 @@ void nh_ws_parse(ws_context_t *ctx) {
 
 void nh_ws_on_close_handler(ws_context_t *ctx, ws_session_t *session) {
     FLAG_SET(session->flags, WEBSOCKET_SESSION_CLOSE);
-    unsigned char *status = malloc(sizeof(unsigned char) * 2);
-    void *tmp;
-    if ((tmp = websocket_store_get(session, 0)) != NULL) {
-        free(tmp);
-    }
-    websocket_store_set(session, 0, status);
+    unsigned char status[2];
     status[0] = 0x03;
     if (ctx == NULL || ctx->frame.payload_length > 0) {
         status[1] = 0xe8;
@@ -1239,7 +1236,11 @@ void nh_ws_recv_handler(ws_session_t *session) {
     if (FLAG_CHECK(session->flags, WEBSOCKET_SESSION_CLOSE)) return;
 
     nh_stream_t stream = {0};
-    if (nh_read_socket(&stream, session->socket) == 0) return;
+    if (nh_read_socket(&stream, session->socket) == 0) {
+        CALL_SESSION_CALLBACK(session->ws_handlers->on_closed, session);
+        nh_ws_session_free(session);
+        return;
+    }
     ws_context_t *ctx;
     if (session->incomplete_recv != NULL && session->incomplete_recv->parse_state != PARSE_WS_DONE) {
         ctx = session->incomplete_recv;
@@ -1262,11 +1263,11 @@ void nh_ws_recv_handler(ws_session_t *session) {
     switch (ctx->frame.opcode) {
         case WEBSOCKET_OP_TEXT:
         case WEBSOCKET_OP_BIN:
-            if (session->ws_handlers->on_message != NULL) session->ws_handlers->on_message(ctx, session);
+            CALL_CONTEXT_CALLBACK(session->ws_handlers->on_message, ctx, session);
             break;
         case WEBSOCKET_OP_CLOSE:
             // on_close callback
-            if (session->ws_handlers->on_close != NULL) session->ws_handlers->on_close(session);
+            CALL_SESSION_CALLBACK(session->ws_handlers->on_close, session);
             nh_ws_on_close_handler(ctx, session);
             return;
         case WEBSOCKET_OP_PING:
@@ -1306,6 +1307,7 @@ void nh_ws_emit_handler(ws_session_t *session) {
     while ((ctx = session->incomplete_emit) != NULL) {
         if (!nh_write_socket(&ctx->stream, session->socket)) {
             // pipe error, cancel and close session
+            CALL_SESSION_CALLBACK(session->ws_handlers->on_closed, session);
             nh_ws_session_free(session);
             return;
         }
@@ -1325,7 +1327,10 @@ void nh_ws_emit_handler(ws_session_t *session) {
         if ((session->incomplete_emit = session->incomplete_emit->next) == NULL) {
             // the last one
             session->incomplete_emit_tail = NULL;
-            if (FLAG_CHECK(session->flags, WEBSOCKET_SESSION_CLOSE)) nh_ws_session_free(session);
+            if (FLAG_CHECK(session->flags, WEBSOCKET_SESSION_CLOSE)) {
+                CALL_SESSION_CALLBACK(session->ws_handlers->on_closed, session);
+                nh_ws_session_free(session);
+            }
         }
     }
 }
@@ -1455,7 +1460,7 @@ ws_session_t *websocket_serve(http_context_t *ctx, ws_handler_t *handlers) {
     // generate ws ctx
     ws_session_t *ws_session = nh_ws_session_init(ctx->session, handlers);
     // on_connect callback
-    if (ws_session->ws_handlers->on_connect != NULL) ws_session->ws_handlers->on_connect(ws_session);
+    CALL_SESSION_CALLBACK(ws_session->ws_handlers->on_connected, ws_session);
     return ws_session;
 }
 
