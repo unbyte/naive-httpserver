@@ -439,6 +439,10 @@ int string_cmp_chars(http_string_t string, char const chars[static 1]) {
     return strlen(chars) == string.len && nh_string_cmp(string.value, chars, string.len);
 }
 
+int string_cmp_string(http_string_t string_a, http_string_t string_b){
+    return string_a.len == string_b.len && nh_string_cmp(string_a.value, string_b.value, string_a.len);
+}
+
 int string_cmp_chars_case_insensitive(http_string_t string, char const chars[static 1]) {
     return strlen(chars) == string.len && nh_string_cmp_case_insensitive(string.value, chars, string.len);
 }

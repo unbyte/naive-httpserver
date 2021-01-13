@@ -61,6 +61,8 @@ char *string_to_chars(http_string_t string);
 
 int string_cmp_chars(http_string_t string, char const chars[static 1]);
 
+int string_cmp_string(http_string_t string_a, http_string_t string_b);
+
 int string_cmp_chars_case_insensitive(http_string_t string, char const chars[static 1]);
 
 // auto free memory after responding
