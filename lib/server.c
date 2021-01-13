@@ -664,7 +664,6 @@ void nh_generate_http_response(http_context_t *ctx) {
 }
 
 void nh_keep_alive_handler(http_context_t *context) {
-    if (FLAG_CHECK(context->session->flags, SESSION_FLAG_UPGRADED)) return;
     // just for keep alive now
     if (context->version == HTTP_1_1) {
         http_string_t connection = get_request_header(context, "Connection");
@@ -692,6 +691,11 @@ void nh_session_read(nh_session_t *session) {
     if (result) {
         // success, process
         session->server->request_handler(&session->context);
+
+#ifndef DISABLE_WEBSOCKET
+        if (FLAG_CHECK(session->flags, SESSION_FLAG_UPGRADED)) return;
+#endif
+
         nh_keep_alive_handler(&session->context);
     } else {
         // fail, report error
@@ -721,12 +725,9 @@ void nh_session_write(nh_session_t *session) {
         return;
     }
 
-    if (FLAG_CHECK(session->flags, SESSION_FLAG_UPGRADED)) {
-        // events will be handled by other protocols so just free session and http context
-        nh_context_clear(&session->context);
-        free(session);
-        return;
-    }
+#ifndef DISABLE_WEBSOCKET
+    if (FLAG_CHECK(session->flags, SESSION_FLAG_UPGRADED)) return;
+#endif
 
     if (FLAG_CHECK(session->flags, SESSION_FLAG_KEEP_ALIVE)) {
         nh_context_clear(&session->context);
@@ -760,6 +761,16 @@ void nh_session_handler(nh_session_t *session) {
         case SESSION_END:
             break;
     }
+
+#ifndef DISABLE_WEBSOCKET
+    if (FLAG_CHECK(session->flags, SESSION_FLAG_UPGRADED)) {
+        // events will be handled by other protocols so just free session and http context
+        nh_context_clear(&session->context);
+        free(session);
+        return;
+    }
+#endif
+
     if (session->state == SESSION_END) nh_session_free(session);
 }
 
@@ -965,7 +976,7 @@ void nh_ws_out_context_free(nh_ws_out_context_t *ctx);
 
 void nh_ws_session_free(ws_session_t *session);
 
-int nh_ws_handshake(http_context_t *context);
+int nh_ws_handshake(http_context_t *ctx);
 
 void nh_ws_parse(ws_context_t *ctx);
 
@@ -1065,30 +1076,39 @@ void nh_ws_session_free(ws_session_t *session) {
 }
 
 // 1 - success; 0 - fail
-int nh_ws_handshake(http_context_t *context) {
+int nh_ws_handshake(http_context_t *ctx) {
     http_string_t key;
-    if (context->version == HTTP_1_0
-        || !string_cmp_chars_case_insensitive(get_request_method(context), "GET")
-        || !string_cmp_chars_case_insensitive(get_request_header(context, "Connection"), "upgrade")
-        || !string_cmp_chars_case_insensitive(get_request_header(context, "Upgrade"), "websocket")
-        || !string_cmp_chars_case_insensitive(get_request_header(context, "Sec-WebSocket-Version"), "13")
+    if (ctx->version == HTTP_1_0
+        || !string_cmp_chars_case_insensitive(get_request_method(ctx), "GET")
+        || !string_cmp_chars_case_insensitive(get_request_header(ctx, "Connection"), "upgrade")
+        || !string_cmp_chars_case_insensitive(get_request_header(ctx, "Upgrade"), "websocket")
+        || !string_cmp_chars_case_insensitive(get_request_header(ctx, "Sec-WebSocket-Version"), "13")
         // skip check about Sec-WebSocket-Protocol and Sec-WebSocket-Extension
         // base64(16bit) = 24bit
-        || (key = get_request_header(context, "Sec-WebSocket-Key")).len != 24) {
-        set_response_status(context, 400);
+        || (key = get_request_header(ctx, "Sec-WebSocket-Key")).len != 24) {
+        set_response_status(ctx, 400);
         return 0;
     }
+
+    // set flag upgraded
+    FLAG_SET(ctx->session->flags, SESSION_FLAG_UPGRADED);
+
     char raw[61] = {0};
     unsigned char sha1_encoded[SHA_DIGEST_LENGTH + 1] = {0};
     strncpy(raw, key.value, 24);
     strcpy(&raw[24], WEBSOCKET_MAGIC_NUMBER);
     SHA1((unsigned char const *) raw, 60, (unsigned char *) sha1_encoded);
-    char *result = (char *) bind_with_context(context, malloc(sizeof(char) * 31));
+    char *result = (char *) bind_with_context(ctx, malloc(sizeof(char) * 31));
     nh_base64_encode(sha1_encoded, SHA_DIGEST_LENGTH, (unsigned char *) result);
-    set_response_status(context, 101);
-    set_response_header(context, "Upgrade", "websocket");
-    set_response_header(context, "Connection", "Upgrade");
-    set_response_header(context, "Sec-WebSocket-Accept", result);
+    set_response_status(ctx, 101);
+    set_response_header(ctx, "Upgrade", "websocket");
+    set_response_header(ctx, "Connection", "Upgrade");
+    set_response_header(ctx, "Sec-WebSocket-Accept", result);
+
+    nh_stream_init(&ctx->response.raw);
+    nh_generate_http_response(ctx);
+    nh_session_write(ctx->session);
+
     return 1;
 }
 
@@ -1434,13 +1454,8 @@ ws_session_t *websocket_serve(http_context_t *ctx, ws_handler_t *handlers) {
     if (!nh_ws_handshake(ctx)) return NULL;
     // generate ws ctx
     ws_session_t *ws_session = nh_ws_session_init(ctx->session, handlers);
-
-    // set flag upgraded
-    FLAG_SET(ctx->session->flags, SESSION_FLAG_UPGRADED);
-
     // on_connect callback
     if (ws_session->ws_handlers->on_connect != NULL) ws_session->ws_handlers->on_connect(ws_session);
-
     return ws_session;
 }
 

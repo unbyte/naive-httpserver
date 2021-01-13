@@ -4,7 +4,7 @@
 
 #define STORE_KEY_USER_ID 0
 
-#define MAX_USER 5
+#define MAX_USER 512
 
 struct {
     ws_session_t *users[MAX_USER];
@@ -12,7 +12,11 @@ struct {
 } room = {0};
 
 void ws_connect_handler(ws_session_t *session) {
-    if (room.users_count == MAX_USER) return;
+    if (room.users_count == MAX_USER) {
+        websocket_emit_text(session, 9, "max users");
+        websocket_close(session);
+        return;
+    }
     room.users[room.users_count] = session;
     uint16_t *id = malloc(sizeof(uint16_t));
     *id = room.users_count++;
@@ -20,7 +24,7 @@ void ws_connect_handler(ws_session_t *session) {
 }
 
 void ws_close_handler(ws_session_t *session) {
-    uint16_t* id = (uint16_t *) websocket_store_get(session, STORE_KEY_USER_ID);
+    uint16_t *id = (uint16_t *) websocket_store_get(session, STORE_KEY_USER_ID);
     if (id == NULL) return;
     char buf[16];
     sprintf(buf, "#%u has quit", *id);
@@ -32,7 +36,7 @@ void ws_close_handler(ws_session_t *session) {
 }
 
 void ws_message_handler(ws_context_t *ctx, ws_session_t *session) {
-    uint16_t* id = (uint16_t *) websocket_store_get(session, STORE_KEY_USER_ID);
+    uint16_t *id = (uint16_t *) websocket_store_get(session, STORE_KEY_USER_ID);
     if (id == NULL) return;
     http_string_t payload = websocket_get_payload(ctx);
     if (string_cmp_chars(payload, "quit")) {
