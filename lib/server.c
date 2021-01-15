@@ -439,7 +439,7 @@ int string_cmp_chars(http_string_t string, char const chars[static 1]) {
     return strlen(chars) == string.len && nh_string_cmp(string.value, chars, string.len);
 }
 
-int string_cmp_string(http_string_t string_a, http_string_t string_b){
+int string_cmp_string(http_string_t string_a, http_string_t string_b) {
     return string_a.len == string_b.len && nh_string_cmp(string_a.value, string_b.value, string_a.len);
 }
 
@@ -1005,7 +1005,7 @@ void nh_ws_event_timer_cb(struct epoll_event *ev);
 
 ws_session_t *nh_ws_session_init(nh_session_t *session, ws_handler_t *handlers);
 
-void nh_ws_emit(ws_session_t *session, uint32_t payload_len, char payload[payload_len], unsigned char op);
+void nh_ws_emit(ws_session_t *session, uint32_t payload_len, char const payload[payload_len], unsigned char op);
 
 /*
  * Implement
@@ -1386,7 +1386,8 @@ ws_session_t *nh_ws_session_init(nh_session_t *session, ws_handler_t *handlers) 
     return ws_session;
 }
 
-void nh_ws_emit(ws_session_t *session, uint32_t payload_len, char *payload, unsigned char op) {
+void nh_ws_emit(ws_session_t *session, uint32_t payload_len, char const payload[payload_len], unsigned char op) {
+    if (FLAG_CHECK(session->flags, WEBSOCKET_SESSION_CLOSE)) return;
     nh_ws_out_context_t *ctx = malloc(sizeof(nh_ws_out_context_t));
     // copy payload
     char *payload_copy = malloc(sizeof(char) * payload_len);
@@ -1450,11 +1451,11 @@ void websocket_close(ws_session_t *session) {
     nh_ws_on_close_handler(NULL, session);
 }
 
-void websocket_emit_binary(ws_session_t *session, uint32_t payload_len, char payload[payload_len]) {
+void websocket_emit_binary(ws_session_t *session, uint32_t payload_len, char const payload[payload_len]) {
     nh_ws_emit(session, payload_len, payload, WEBSOCKET_OP_BIN);
 }
 
-void websocket_emit_text(ws_session_t *session, uint32_t payload_len, char payload[payload_len]) {
+void websocket_emit_text(ws_session_t *session, uint32_t payload_len, char const payload[payload_len]) {
     nh_ws_emit(session, payload_len, payload, WEBSOCKET_OP_TEXT);
 }
 

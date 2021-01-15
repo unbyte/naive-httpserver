@@ -88,9 +88,9 @@ typedef struct ws_handler_s {
 
 ws_session_t *websocket_serve(http_context_t *ctx, ws_handler_t *handlers);
 
-void websocket_emit_binary(ws_session_t *session, uint32_t payload_len, char payload[payload_len]);
+void websocket_emit_binary(ws_session_t *session, uint32_t payload_len, char const payload[payload_len]);
 
-void websocket_emit_text(ws_session_t *session, uint32_t payload_len, char payload[payload_len]);
+void websocket_emit_text(ws_session_t *session, uint32_t payload_len, char const payload[payload_len]);
 
 void websocket_close(ws_session_t *session);
 
